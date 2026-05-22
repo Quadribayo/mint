@@ -1,0 +1,5 @@
+.env
+wallets.json
+watched_contracts.json
+__pycache__/
+*.pyc

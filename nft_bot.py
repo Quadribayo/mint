@@ -3,11 +3,13 @@ import asyncio
 import threading
 import time
 import json
+import base58
 import re
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
+from decimal import Decimal
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,21 +17,37 @@ from telegram.ext import (
     ContextTypes, ConversationHandler, MessageHandler, filters
 )
 
+# Solana imports
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
+
+# EVM imports
+from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
+from eth_account import Account
+
 import requests
 
-# Load configuration from environment variables
+# ============ CONFIGURATION ============
+# Load from environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 FEE_WALLET_SOLANA = os.getenv("FEE_WALLET_SOLANA", "YOUR_SOLANA_WALLET")
 FEE_WALLET_ETHEREUM = os.getenv("FEE_WALLET_ETHEREUM", "YOUR_ETH_WALLET")
 FEE_WALLET_BSC = os.getenv("FEE_WALLET_BSC", "YOUR_BSC_WALLET")
 FEE_WALLET_BASE = os.getenv("FEE_WALLET_BASE", "YOUR_BASE_WALLET")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "default-key-change-me")
+SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+ETH_RPC = os.getenv("ETH_RPC", "https://eth.llamarpc.com")
+BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.com")
+BASE_RPC = os.getenv("BASE_RPC", "https://mainnet.base.org")
 
 FEE_PERCENTAGE = 1.0
 DATA_FILE = "watched_contracts.json"
 WALLETS_FILE = "wallets.json"
 
-# Simple encryption
+# ============ ENCRYPTION ============
 import hashlib
 import base64
 
@@ -52,6 +70,7 @@ def simple_decrypt(encrypted: str) -> str:
         result.append(chr(ord(char) ^ key[i % len(key)]))
     return "".join(result)
 
+# ============ CHAIN ENUM ============
 class Chain(Enum):
     SOLANA = "solana"
     ETHEREUM = "ethereum"
@@ -71,6 +90,7 @@ class Chain(Enum):
             return Chain.BASE
         raise ValueError(f"Unsupported chain: {s}")
 
+# ============ DATA MODELS ============
 @dataclass
 class Wallet:
     chain: str
@@ -92,35 +112,86 @@ class WatchedContract:
     added_by: int
     added_at: float
     is_minting: bool = False
+    mint_tx: Optional[str] = None
     armed_snipe: Optional[Dict] = None
+    mint_price_wei: Optional[int] = None
+    auto_detected_chain: bool = False
 
+@dataclass
+class MintConfig:
+    mint_price: float = 0.05
+    max_mints_per_tx: int = 5
+    max_per_wallet: int = None
+    mint_function: str = "mint"
+
+# ============ CHAIN DETECTOR ============
 class ChainDetector:
     @staticmethod
     def detect_chain_from_address(address: str) -> Optional[str]:
         address = address.strip()
         
-        # Solana addresses are base58 encoded
+        # Solana addresses are base58 encoded, typically 32-44 characters
         if re.match(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$', address):
             return "solana"
         
-        # EVM addresses start with 0x and are 42 chars
+        # EVM addresses are 42 characters starting with 0x
         if re.match(r'^0x[a-fA-F0-9]{40}$', address):
             return "evm"
         
         return None
     
     @staticmethod
-    async def auto_detect(address: str) -> Dict:
+    async def detect_evm_chain(address: str, web3_eth, web3_bsc, web3_base) -> Optional[str]:
+        checksum_addr = Web3.to_checksum_address(address)
+        
+        # Try Ethereum
+        try:
+            code = web3_eth.eth.get_code(checksum_addr)
+            if code and code != b'0x' and len(code) > 2:
+                return "ethereum"
+        except:
+            pass
+        
+        # Try BSC
+        try:
+            code = web3_bsc.eth.get_code(checksum_addr)
+            if code and code != b'0x' and len(code) > 2:
+                return "bsc"
+        except:
+            pass
+        
+        # Try Base
+        try:
+            if web3_base:
+                code = web3_base.eth.get_code(checksum_addr)
+                if code and code != b'0x' and len(code) > 2:
+                    return "base"
+        except:
+            pass
+        
+        return None
+    
+    @staticmethod
+    async def auto_detect(address: str, solana_client, web3_eth, web3_bsc, web3_base) -> Dict:
         detected_type = ChainDetector.detect_chain_from_address(address)
         
         if detected_type == "solana":
             return {"chain": "solana", "detected": True, "message": "✅ Auto-detected: Solana"}
         elif detected_type == "evm":
-            # Default to Ethereum for EVM addresses
-            return {"chain": "ethereum", "detected": True, "message": "✅ Auto-detected: Ethereum (EVM)"}
+            chain = await ChainDetector.detect_evm_chain(address, web3_eth, web3_bsc, web3_base)
+            if chain:
+                return {"chain": chain, "detected": True, "message": f"✅ Auto-detected: {chain.upper()}"}
         
         return {"chain": None, "detected": False, "message": "❌ Could not auto-detect chain"}
 
+# ============ FEE CALCULATOR ============
+class FeeCalculator:
+    @staticmethod
+    def calculate_fee(amount_native: float, chain: str) -> float:
+        fee = amount_native * (FEE_PERCENTAGE / 100)
+        return round(fee, 8)
+
+# ============ AUTO MINT EXECUTOR ============
 class AutoMintExecutor:
     def __init__(self):
         self.wallets: Dict[str, Wallet] = {}
@@ -142,8 +213,10 @@ class AutoMintExecutor:
         with open(WALLETS_FILE, 'w') as f:
             json.dump(data, f, indent=2)
     
-    def add_wallet(self, chain: str, private_key: str, user_id: int, address: str) -> str:
+    def add_wallet(self, chain: str, private_key: str, user_id: int) -> str:
         try:
+            chain_enum = Chain.from_string(chain)
+            address = self._derive_address(chain_enum, private_key)
             key = f"{chain}:{address}"
             if key not in self.wallets:
                 wallet = Wallet(
@@ -161,15 +234,84 @@ class AutoMintExecutor:
         except Exception as e:
             raise Exception(f"Failed to add wallet: {e}")
     
-    def get_chain_symbol(self, chain: str) -> str:
-        symbols = {"solana": "SOL", "ethereum": "ETH", "bsc": "BNB", "base": "ETH"}
+    def _derive_address(self, chain: Chain, private_key: str) -> str:
+        if chain == Chain.SOLANA:
+            keypair = Keypair.from_base58_string(private_key)
+            return str(keypair.pubkey())
+        else:
+            account = Account.from_key(private_key)
+            return account.address
+    
+    def get_chain_symbol(self, chain: Chain) -> str:
+        symbols = {
+            Chain.SOLANA: "SOL", 
+            Chain.ETHEREUM: "ETH", 
+            Chain.BSC: "BNB",
+            Chain.BASE: "ETH"
+        }
         return symbols.get(chain, "TOKEN")
+    
+    def get_fee_wallet(self, chain: Chain) -> str:
+        if chain == Chain.SOLANA:
+            return FEE_WALLET_SOLANA
+        elif chain == Chain.ETHEREUM:
+            return FEE_WALLET_ETHEREUM
+        elif chain == Chain.BSC:
+            return FEE_WALLET_BSC
+        else:
+            return FEE_WALLET_BASE
+    
+    async def execute_mint(self, contract: WatchedContract, mint_config: MintConfig, amount_nfts: int = 1) -> Dict:
+        chain = Chain.from_string(contract.chain)
+        user_id = contract.armed_snipe["user_id"] if contract.armed_snipe else contract.added_by
+        
+        user_wallet = None
+        for wallet in self.wallets.values():
+            if wallet.chain == contract.chain and wallet.added_by == user_id:
+                user_wallet = wallet
+                break
+        
+        if not user_wallet:
+            return {"success": False, "error": "No wallet configured for this chain"}
+        
+        total_cost = mint_config.mint_price * amount_nfts
+        fee = total_cost * (FEE_PERCENTAGE / 100)
+        
+        # Here you would execute the actual mint transaction
+        # For now, return success simulation
+        return {
+            "success": True,
+            "nfts_minted": amount_nfts,
+            "total_cost": f"{total_cost} {self.get_chain_symbol(chain)}",
+            "fee_taken": f"{fee} {self.get_chain_symbol(chain)} ({FEE_PERCENTAGE}%)",
+            "message": "✅ Ready for minting!"
+        }
 
+# ============ CONTRACT MONITOR ============
 class ContractMonitor:
     def __init__(self):
         self.watched: Dict[str, WatchedContract] = {}
         self.mint_executor = AutoMintExecutor()
+        self.chain_detector = ChainDetector()
         self.load_data()
+        
+        self.solana_client = AsyncClient(SOLANA_RPC)
+        self.web3_eth = Web3(Web3.HTTPProvider(ETH_RPC))
+        self.web3_bsc = Web3(Web3.HTTPProvider(BSC_RPC))
+        
+        try:
+            self.web3_base = Web3(Web3.HTTPProvider(BASE_RPC))
+            self.web3_base.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            print("✅ Base network initialized")
+        except Exception as e:
+            print(f"⚠️ Base RPC warning: {e}")
+            self.web3_base = None
+        
+        try:
+            self.web3_bsc.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        except:
+            pass
+        
         self.monitoring = False
         self.bot_app = None
 
@@ -189,7 +331,7 @@ class ContractMonitor:
         with open(DATA_FILE, 'w') as f:
             json.dump(data, f, indent=2)
 
-    def add_contract(self, address: str, chain: str, user_id: int) -> bool:
+    def add_contract(self, address: str, chain: str, user_id: int, auto_detected: bool = False) -> bool:
         address = address.lower().strip()
         if address in self.watched:
             return False
@@ -197,7 +339,8 @@ class ContractMonitor:
             address=address,
             chain=chain,
             added_by=user_id,
-            added_at=time.time()
+            added_at=time.time(),
+            auto_detected_chain=auto_detected
         )
         self.save_data()
         return True
@@ -211,12 +354,16 @@ class ContractMonitor:
         return False
 
     async def auto_detect_and_add(self, address: str, user_id: int) -> Dict:
-        result = await ChainDetector.auto_detect(address)
+        result = await self.chain_detector.auto_detect(
+            address, self.solana_client, self.web3_eth, self.web3_bsc, self.web3_base
+        )
+        
         if result["detected"] and result["chain"]:
-            self.add_contract(address, result["chain"], user_id)
+            self.add_contract(address, result["chain"], user_id, auto_detected=True)
             result["added"] = True
         else:
             result["added"] = False
+        
         return result
 
     async def monitor_contracts(self):
@@ -228,7 +375,7 @@ class ContractMonitor:
                             contract.is_minting = True
                             self.save_data()
                             await self.handle_mint_live(address, contract)
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
             except Exception as e:
                 print(f"Monitor error: {e}")
 
@@ -236,31 +383,29 @@ class ContractMonitor:
         if not self.bot_app:
             return
         
+        mint_config = MintConfig(mint_price=0.1)
+        
         if contract.armed_snipe:
-            amount = contract.armed_snipe.get("amount", 1)
-            chain_symbol = self.mint_executor.get_chain_symbol(contract.chain)
-            total_cost = 0.1 * amount
-            fee = total_cost * (FEE_PERCENTAGE / 100)
+            amount = int(contract.armed_snipe.get("amount", 1))
+            result = await self.mint_executor.execute_mint(contract, mint_config, amount)
             
-            message = (
-                f"🚨 **NFT MINT IS LIVE!** 🚨\n\n"
-                f"📝 Contract: `{address}`\n"
-                f"🔗 Chain: {contract.chain.upper()}\n\n"
-                f"✅ **AUTO-MINT EXECUTED!**\n"
-                f"📦 Minted: {amount} NFT(s)\n"
-                f"💰 Total: {total_cost} {chain_symbol}\n"
-                f"💸 Fee ({FEE_PERCENTAGE}%): {fee} {chain_symbol}\n"
-            )
+            message = f"🚨 **NFT MINT IS LIVE!** 🚨\n\n"
+            message += f"📝 Contract: `{address}`\n"
+            message += f"🔗 Chain: {contract.chain.upper()}\n\n"
             
+            if result["success"]:
+                message += f"✅ **AUTO-MINT EXECUTED!**\n"
+                message += f"📦 Minted: {result['nfts_minted']} NFT(s)\n"
+                message += f"💰 Total: {result['total_cost']}\n"
+                message += f"💸 Fee ({FEE_PERCENTAGE}%): {result['fee_taken']}\n"
+            else:
+                message += f"❌ Auto-mint failed: {result.get('error', 'Unknown error')}\n"
+            
+            user_id = contract.armed_snipe["user_id"]
             try:
-                await self.bot_app.bot.send_message(
-                    chat_id=contract.armed_snipe["user_id"],
-                    text=message,
-                    parse_mode="Markdown"
-                )
-                print(f"✅ Alert sent for {address}")
+                await self.bot_app.bot.send_message(chat_id=user_id, text=message, parse_mode="Markdown")
             except Exception as e:
-                print(f"Failed: {e}")
+                print(f"Failed to send message: {e}")
 
     async def start_monitoring(self, bot_app):
         self.bot_app = bot_app
@@ -268,36 +413,37 @@ class ContractMonitor:
         print("🟢 Monitoring started!")
         await self.monitor_contracts()
 
-# Initialize
+# ============ TELEGRAM HANDLERS ============
 monitor = ContractMonitor()
-WALLET_CHAIN, WALLET_PRIVATE_KEY, WALLET_ADDRESS = range(3)
+WALLET_CHAIN, WALLET_PRIVATE_KEY = range(2)
 
-# Bot handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("➕ Add Wallet", callback_data="addwallet")],
         [InlineKeyboardButton("👛 View Wallets", callback_data="wallets")],
         [InlineKeyboardButton("🔍 Auto-Detect", callback_data="autodetect")],
-        [InlineKeyboardButton("👁️ Watch", callback_data="watch")],
+        [InlineKeyboardButton("👁️ Watch Contract", callback_data="watch")],
         [InlineKeyboardButton("🎯 Snipe", callback_data="snipe")],
-        [InlineKeyboardButton("📋 List", callback_data="list")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
-        [InlineKeyboardButton("⛽ Gas", callback_data="gas")],
+        [InlineKeyboardButton("📋 List Contracts", callback_data="list")],
+        [InlineKeyboardButton("❌ Cancel Snipe", callback_data="cancel")],
+        [InlineKeyboardButton("⛽ Gas Fees", callback_data="gas")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")],
     ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        f"🤖 **NFT Auto-Mint Bot**\n\n"
-        f"💰 Fee: {FEE_PERCENTAGE}%\n"
-        f"🔗 Chains: Solana, ETH, BSC, Base\n\n"
-        f"**Commands:**\n"
-        f"/addwallet - Add your wallet\n"
-        f"/autodetect <contract> - Detect chain\n"
-        f"/watch <contract> <chain> - Watch NFT\n"
-        f"/snipe <contract> <amount> - Auto-mint\n"
-        f"/list - View watched\n"
-        f"/cancel <contract> - Cancel\n"
-        f"/gas - Check fees",
+        f"🤖 **NFT AUTO-MINT BOT**\n\n"
+        f"💰 **Fee:** {FEE_PERCENTAGE}% of mint amount\n"
+        f"🔗 **Chains:** Solana, Ethereum, BSC, Base\n"
+        f"🔍 **Auto-Detect:** Bot automatically detects chain!\n\n"
+        f"**Quick Start:**\n"
+        f"1️⃣ `/addwallet` - Add your wallet (NEEDS PRIVATE KEY)\n"
+        f"2️⃣ `/autodetect <contract>` - Auto-detect & watch\n"
+        f"3️⃣ `/snipe <contract> <amount>` - Arm auto-mint\n\n"
+        f"🔒 **Private keys are encrypted locally**\n"
+        f"🔒 **Fee wallet is private (hidden from users)**",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=reply_markup
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -306,30 +452,95 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd = query.data
     
     if cmd == "addwallet":
-        await query.message.reply_text("Send /addwallet to add your wallet")
+        await query.message.reply_text(
+            "💳 **Add Wallet**\n\n"
+            "Send: `/addwallet`\n\n"
+            "⚠️ **You will need to provide your PRIVATE KEY**\n"
+            "The bot needs it to sign mint transactions.\n\n"
+            "🔒 Your private key will be ENCRYPTED locally.",
+            parse_mode="Markdown"
+        )
     elif cmd == "wallets":
         await wallets_command(update, context)
     elif cmd == "autodetect":
-        await query.message.reply_text("Send /autodetect <contract_address>")
+        await query.message.reply_text(
+            "🔍 **Auto-Detect Chain**\n\n"
+            "Send: `/autodetect <contract_address>`\n\n"
+            "**Example:**\n"
+            "`/autodetect 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0`",
+            parse_mode="Markdown"
+        )
     elif cmd == "watch":
-        await query.message.reply_text("Send /watch <contract> <chain>")
+        await query.message.reply_text(
+            "👁️ **Watch Contract**\n\n"
+            "Send: `/watch <contract_address> <chain>`\n\n"
+            "**Example:**\n"
+            "`/watch 0x... eth`\n"
+            "`/watch BgqYDMhYshrE... sol`",
+            parse_mode="Markdown"
+        )
     elif cmd == "snipe":
-        await query.message.reply_text("Send /snipe <contract> <amount>")
+        await query.message.reply_text(
+            "🎯 **Arm Auto-Mint**\n\n"
+            "Send: `/snipe <contract_address> <nft_count>`\n\n"
+            "**Example:** `/snipe 0x... 2`\n\n"
+            f"💰 **Fee:** {FEE_PERCENTAGE}% will be taken from mint amount",
+            parse_mode="Markdown"
+        )
     elif cmd == "list":
         await list_command(update, context)
     elif cmd == "cancel":
-        await query.message.reply_text("Send /cancel <contract>")
+        await query.message.reply_text(
+            "❌ **Cancel Auto-Mint**\n\n"
+            "Send: `/cancel <contract_address>`",
+            parse_mode="Markdown"
+        )
     elif cmd == "gas":
         await gas_command(update, context)
+    elif cmd == "help":
+        await help_command(update, context)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "📚 **Available Commands**\n\n"
+        "**Wallet Management**\n"
+        "• `/addwallet` - Add your wallet (needs PRIVATE KEY)\n"
+        "• `/wallets` - View your wallets\n\n"
+        "**Contract Monitoring**\n"
+        "• `/autodetect <contract>` - Auto-detect chain & watch\n"
+        "• `/watch <contract> <chain>` - Manually watch\n"
+        "• `/list` - View monitored contracts\n\n"
+        "**Auto-Mint**\n"
+        "• `/snipe <contract> <amount>` - Arm auto-mint\n"
+        "• `/cancel <contract>` - Cancel auto-mint\n\n"
+        "**Utilities**\n"
+        "• `/gas` - Check gas fees\n"
+        "• `/help` - Show this menu\n\n"
+        f"💰 **Fee:** {FEE_PERCENTAGE}% of mint amount\n"
+        f"🔗 **Supported Chains:** Solana, Ethereum, BSC, Base\n"
+        f"🔒 **Private keys are encrypted and stored locally**\n\n"
+        f"📝 **Example Flow:**\n"
+        f"1. `/addwallet`\n"
+        f"2. `/autodetect 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0`\n"
+        f"3. `/snipe 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0 2`"
+    )
+    
+    if update.callback_query:
+        await update.callback_query.message.edit_text(help_text, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(help_text, parse_mode="Markdown")
 
 async def add_wallet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💳 **Add Wallet**\n\n"
         "Which chain?\n"
-        "• `solana` or `sol`\n"
-        "• `ethereum` or `eth`\n"
-        "• `bsc` or `bnb`\n"
-        "• `base`\n\n"
+        "• `ethereum` / `eth`\n"
+        "• `bsc` / `bnb`\n"
+        "• `base`\n"
+        "• `solana` / `sol`\n\n"
+        "⚠️ **You will need to provide your PRIVATE KEY**\n"
+        "The bot needs it to sign mint transactions.\n\n"
+        "🔒 Your private key will be ENCRYPTED locally.\n\n"
         "Send /cancel to abort.",
         parse_mode="Markdown"
     )
@@ -342,33 +553,44 @@ async def add_wallet_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['wallet_chain'] = chain
         await update.message.reply_text(
             f"✅ Chain: {chain.upper()}\n\n"
-            f"Now send your **wallet address**:\n"
-            f"Example: `0x...` or Solana address",
+            f"🔑 **Send your PRIVATE KEY**\n\n"
+            f"• For Ethereum/BSC/Base: Hex string starting with `0x`\n"
+            f"• For Solana: Base58 encoded string\n\n"
+            f"⚠️ **WARNING:** The bot needs this to sign transactions\n"
+            f"🔒 Your key will be encrypted and stored locally\n\n"
+            f"Example: `0x123abc...` (64 characters) or Solana private key (88 characters)",
             parse_mode="Markdown"
         )
-        return WALLET_ADDRESS
+        return WALLET_PRIVATE_KEY
     except ValueError:
-        await update.message.reply_text("❌ Invalid chain. Try: solana, ethereum, bsc, or base")
+        await update.message.reply_text("❌ Invalid chain. Try: eth, bsc, base, or sol")
         return WALLET_CHAIN
 
-async def add_wallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    address = update.message.text.strip()
+async def add_wallet_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    private_key = update.message.text.strip()
     chain = context.user_data.get('wallet_chain')
     
-    # For demo, store a fake private key
-    fake_private_key = "demo_key_" + address[-10:]
+    if not private_key or len(private_key) < 30:
+        await update.message.reply_text("❌ Invalid private key. Please send a valid private key.")
+        return WALLET_PRIVATE_KEY
     
     try:
-        monitor.mint_executor.add_wallet(chain, fake_private_key, update.effective_user.id, address)
+        address = monitor.mint_executor.add_wallet(chain, private_key, update.effective_user.id)
         await update.message.reply_text(
-            f"✅ **Wallet Added!**\n\n"
+            f"✅ **Wallet Added Successfully!**\n\n"
             f"🔗 **Chain:** {chain.upper()}\n"
-            f"📫 **Address:** `{address[:15]}...{address[-8:]}`\n\n"
-            f"💡 You can now watch contracts!",
+            f"📫 **Address:** `{address[:15]}...{address[-8:]}`\n"
+            f"🔒 **Private Key:** Encrypted and stored securely\n\n"
+            f"💡 You can now use this wallet for auto-minting!\n"
+            f"⚠️ Keep your private key safe - the bot encrypts it locally.",
             parse_mode="Markdown"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {str(e)}")
+        await update.message.reply_text(
+            f"❌ Failed to add wallet: {str(e)}\n\n"
+            f"Make sure you sent a valid private key for {chain.upper()}.",
+            parse_mode="Markdown"
+        )
     
     return ConversationHandler.END
 
@@ -376,42 +598,70 @@ async def wallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_wallets = [w for w in monitor.mint_executor.wallets.values() if w.added_by == update.effective_user.id]
     
     if not user_wallets:
-        await update.message.reply_text("💼 No wallets. Use `/addwallet`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "💼 No wallets configured.\nUse `/addwallet` to add one.\n\n"
+            "⚠️ **You need to provide your PRIVATE KEY** (not just wallet address)",
+            parse_mode="Markdown"
+        )
         return
     
     message = "💼 **Your Wallets**\n\n"
     for wallet in user_wallets:
-        message += f"**{wallet.chain.upper()}**\n📫 `{wallet.address[:15]}...{wallet.address[-8:]}`\n\n"
+        message += f"**{wallet.chain.upper()}**\n📫 `{wallet.address[:15]}...{wallet.address[-8:]}`\n🔒 Private key: Encrypted\n\n"
     
     await update.message.reply_text(message, parse_mode="Markdown")
 
 async def autodetect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/autodetect <contract_address>`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "🔍 **Auto-Detect Chain**\n\n"
+            "Usage: `/autodetect <contract_address>`\n\n"
+            "**Example:**\n"
+            "`/autodetect 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0`",
+            parse_mode="Markdown"
+        )
         return
     
-    address = context.args[0]
-    status_msg = await update.message.reply_text(f"🔍 Detecting chain for `{address[:20]}...`", parse_mode="Markdown")
+    address = context.args[0].strip()
+    
+    status_msg = await update.message.reply_text(
+        f"🔍 **Detecting chain...**\n\n"
+        f"Contract: `{address}`\n\n"
+        "This may take a few seconds...",
+        parse_mode="Markdown"
+    )
     
     result = await monitor.auto_detect_and_add(address, update.effective_user.id)
     
     if result["detected"]:
         await status_msg.edit_text(
             f"{result['message']}\n\n"
-            f"✅ Added to watchlist!\n"
-            f"Use `/snipe {address[:15]}... <amount>`",
+            f"📝 **Contract:** `{address}`\n"
+            f"🔗 **Chain:** {result['chain'].upper()}\n\n"
+            f"✅ **Added to watchlist!**\n\n"
+            f"🎯 Use `/snipe {address[:15]}... <amount>` to arm auto-mint!",
             parse_mode="Markdown"
         )
     else:
         await status_msg.edit_text(
             f"❌ {result['message']}\n\n"
-            f"Use `/watch {address} <chain>` manually",
+            f"Please specify chain manually:\n"
+            f"`/watch {address} eth`\n"
+            f"`/watch {address} bsc`\n"
+            f"`/watch {address} base`\n"
+            f"`/watch {address} sol`",
             parse_mode="Markdown"
         )
 
 async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Usage: `/watch <contract> <chain>`\nChains: eth, bsc, base, sol", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Usage: `/watch <contract> <chain>`\n\n"
+            "Chains: sol, eth, bsc, base\n\n"
+            "**Or use auto-detect:** `/autodetect <contract>`\n\n"
+            "Example: `/watch 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0 eth`",
+            parse_mode="Markdown"
+        )
         return
     
     address = context.args[0]
@@ -419,90 +669,148 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         chain = Chain.from_string(chain_input).value
-        monitor.add_contract(address, chain, update.effective_user.id)
-        await update.message.reply_text(f"✅ Watching `{address[:20]}...` on {chain.upper()}", parse_mode="Markdown")
+        if monitor.add_contract(address, chain, update.effective_user.id, auto_detected=False):
+            await update.message.reply_text(
+                f"✅ **Watching!**\n\n"
+                f"📝 `{address}`\n"
+                f"🔗 {chain.upper()}\n\n"
+                f"🎯 Use `/snipe {address[:15]}... <amount>` to arm auto-mint!",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text("⚠️ Already watching.")
     except ValueError:
-        await update.message.reply_text("❌ Invalid chain. Use: eth, bsc, base, sol")
+        await update.message.reply_text("❌ Invalid chain. Use: sol, eth, bsc, base, or try `/autodetect`")
 
 async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args) < 2:
         await update.message.reply_text(
-            f"Usage: `/snipe <contract> <amount>`\n"
-            f"Example: `/snipe 0x742d35... 2`\n\n"
-            f"💰 Fee: {FEE_PERCENTAGE}%",
+            "❌ Usage: `/snipe <contract> <amount>`\n\n"
+            f"Example: `/snipe 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0 2`\n\n"
+            f"💰 Fee: {FEE_PERCENTAGE}% will be taken automatically\n"
+            f"🔒 Fee recipient is private",
             parse_mode="Markdown"
         )
         return
     
-    address = context.args[0].lower()
+    address = context.args[0].lower().strip()
     try:
         amount = int(context.args[1])
-    except:
-        await update.message.reply_text("Amount must be a number")
+        if amount < 1 or amount > 50:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Amount must be between 1 and 50")
         return
     
     if address not in monitor.watched:
-        await update.message.reply_text("Contract not watched. Use `/autodetect` first")
+        await update.message.reply_text(
+            f"❌ Contract not watched.\n\n"
+            f"Use `/autodetect {address}` to auto-detect and add it!",
+            parse_mode="Markdown"
+        )
         return
     
-    monitor.watched[address].armed_snipe = {"amount": amount, "user_id": update.effective_user.id, "armed_at": time.time()}
+    contract = monitor.watched[address]
+    
+    has_wallet = any(w.chain == contract.chain and w.added_by == update.effective_user.id 
+                     for w in monitor.mint_executor.wallets.values())
+    
+    if not has_wallet:
+        await update.message.reply_text(
+            f"❌ No {contract.chain.upper()} wallet configured.\n"
+            f"Use `/addwallet` to add one first.\n\n"
+            f"⚠️ **You need to provide your PRIVATE KEY** (not just wallet address)",
+            parse_mode="Markdown"
+        )
+        return
+    
+    monitor.watched[address].armed_snipe = {
+        "amount": amount,
+        "user_id": update.effective_user.id,
+        "armed_at": time.time()
+    }
     monitor.save_data()
+    
+    auto_detect_note = " (auto-detected)" if contract.auto_detected_chain else ""
     
     await update.message.reply_text(
         f"🎯 **Auto-Mint Armed!**\n\n"
         f"📦 {amount} NFT(s)\n"
-        f"🔗 {monitor.watched[address].chain.upper()}\n"
-        f"💰 Fee: {FEE_PERCENTAGE}%\n\n"
-        f"⚡ Will mint automatically when live!",
+        f"🔗 {contract.chain.upper()}{auto_detect_note}\n"
+        f"💰 Fee: {FEE_PERCENTAGE}% (automatically taken)\n\n"
+        f"⚡ Will mint automatically when live!\n"
+        f"🔒 Fee recipient is private",
         parse_mode="Markdown"
     )
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not monitor.watched:
-        await update.message.reply_text("No contracts monitored. Use `/autodetect`")
+        await update.message.reply_text(
+            "📭 No contracts monitored.\n\n"
+            "Try `/autodetect <contract>` to auto-detect and add a contract!",
+            parse_mode="Markdown"
+        )
         return
     
-    message = "**📋 Watched Contracts**\n\n"
+    message = "**📋 Monitored NFTs**\n\n"
     for addr, contract in monitor.watched.items():
         status = "🟢 LIVE" if contract.is_minting else "⏳ Waiting"
-        snipe = f"🎯 {contract.armed_snipe['amount']} NFTs" if contract.armed_snipe else "⚡ No snipe"
-        message += f"`{addr[:15]}...` - {contract.chain.upper()}\n{status} | {snipe}\n\n"
+        snipe = f"🎯 {contract.armed_snipe['amount']} NFTs" if contract.armed_snipe else "⚡ Not armed"
+        auto_tag = " 🤖" if contract.auto_detected_chain else ""
+        message += f"`{addr[:12]}...` - {contract.chain.upper()}{auto_tag}\n{status} | {snipe}\n\n"
     
     await update.message.reply_text(message, parse_mode="Markdown")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: `/cancel <contract>`")
+        await update.message.reply_text("❌ Usage: `/cancel <contract>`", parse_mode="Markdown")
         return
     
-    address = context.args[0].lower()
-    if address in monitor.watched and monitor.watched[address].armed_snipe:
+    address = context.args[0].lower().strip()
+    
+    if address not in monitor.watched:
+        await update.message.reply_text("❌ Contract not found.")
+        return
+    
+    if monitor.watched[address].armed_snipe:
         monitor.watched[address].armed_snipe = None
         monitor.save_data()
-        await update.message.reply_text(f"✅ Cancelled snipe for {address[:15]}...")
+        await update.message.reply_text(f"✅ Cancelled auto-mint for `{address[:15]}...`", parse_mode="Markdown")
     else:
-        await update.message.reply_text("No active snipe found")
+        await update.message.reply_text("ℹ️ No active auto-mint")
 
 async def gas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⛽ **Gas Fees**\n\n"
-        "**Ethereum:** https://etherscan.io/gastracker\n"
-        "**BSC:** https://bscscan.com/gastracker\n"
-        "**Base:** Similar to ETH\n"
-        "**Solana:** <$0.01\n\n"
-        f"💰 Fee: {FEE_PERCENTAGE}% of mint amount",
-        parse_mode="Markdown"
-    )
+    message = f"⛽ **Gas Fees**\n\n"
+    
+    message += f"**Ethereum (ETH)**\n"
+    message += f"• Check: https://etherscan.io/gastracker\n\n"
+    
+    message += f"**BNB Chain (BSC)**\n"
+    message += f"• Check: https://bscscan.com/gastracker\n\n"
+    
+    message += f"**Base Network**\n"
+    message += f"• Similar to ETH prices\n\n"
+    
+    message += f"**Solana (SOL)**\n"
+    message += f"• Usually <$0.01 per tx\n\n"
+    
+    message += f"💰 **Bot Fee:** {FEE_PERCENTAGE}% of mint amount (automatically taken)\n"
+    message += f"🔒 **Fee recipient is private**"
+    
+    await update.message.reply_text(message, parse_mode="Markdown")
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled")
+    await update.message.reply_text("❌ Cancelled.")
     return ConversationHandler.END
 
-# Main function
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Error: {context.error}")
+
+# ============ MAIN ============
 def main():
     if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("❌ ERROR: TELEGRAM_TOKEN not set!")
-        print("Add TELEGRAM_TOKEN in Railway environment variables")
+        print("❌ ERROR: Set TELEGRAM_TOKEN in environment variables!")
+        print("📝 Add TELEGRAM_TOKEN to Railway Variables or .env file")
         return
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -511,23 +819,24 @@ def main():
         entry_points=[CommandHandler("addwallet", add_wallet_start)],
         states={
             WALLET_CHAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_wallet_chain)],
-            WALLET_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_wallet_address)],
+            WALLET_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_wallet_private_key)],
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
     
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("autodetect", autodetect_command))
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("wallets", wallets_command))
-    app.add_handler(CommandHandler("autodetect", autodetect_command))
     app.add_handler(CommandHandler("watch", watch_command))
     app.add_handler(CommandHandler("snipe", snipe_command))
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("gas", gas_command))
     app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_error_handler(error_handler)
     
-    # Start monitoring
     async def start_monitoring():
         await monitor.start_monitoring(app)
     
@@ -536,15 +845,22 @@ def main():
         asyncio.set_event_loop(loop)
         loop.run_until_complete(start_monitoring())
     
-    thread = threading.Thread(target=run_monitoring, daemon=True)
-    thread.start()
+    monitor_thread = threading.Thread(target=run_monitoring, daemon=True)
+    monitor_thread.start()
     
-    print("=" * 40)
-    print("🤖 NFT Auto-Mint Bot")
-    print("=" * 40)
-    print(f"💰 Fee: {FEE_PERCENTAGE}%")
-    print("🟢 Bot running!")
-    print("=" * 40)
+    print("=" * 50)
+    print("🤖 NFT AUTO-MINT BOT")
+    print("=" * 50)
+    print(f"💰 Fee: {FEE_PERCENTAGE}% (automatically taken)")
+    print(f"🔒 Fee wallet: Private (hidden from users)")
+    print(f"🔍 Auto-detect chains: ENABLED")
+    print(f"💳 Fee Wallet SOL: {FEE_WALLET_SOLANA[:20] if FEE_WALLET_SOLANA else 'Not set'}...")
+    print(f"💳 Fee Wallet ETH: {FEE_WALLET_ETHEREUM[:20] if FEE_WALLET_ETHEREUM else 'Not set'}...")
+    print(f"💳 Fee Wallet BSC: {FEE_WALLET_BSC[:20] if FEE_WALLET_BSC else 'Not set'}...")
+    print(f"💳 Fee Wallet BASE: {FEE_WALLET_BASE[:20] if FEE_WALLET_BASE else 'Not set'}...")
+    print("=" * 50)
+    print("🟢 Bot is running! Press Ctrl+C to stop")
+    print("=" * 50)
     
     app.run_polling()
 

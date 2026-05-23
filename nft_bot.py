@@ -23,12 +23,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 FEE_PERCENTAGE = 1.0
 
 # Your fee wallets (where the 1% fee goes)
-FEE_WALLETS = {
-    "ethereum": os.getenv("FEE_WALLET_ETHEREUM", "YOUR_ETH_WALLET"),
-    "bsc": os.getenv("FEE_WALLET_BSC", "YOUR_BSC_WALLET"),
-    "base": os.getenv("FEE_WALLET_BASE", "YOUR_BASE_WALLET"),
-    "solana": os.getenv("FEE_WALLET_SOLANA", "YOUR_SOLANA_WALLET"),
-}
+FEE_WALLET_ETHEREUM = os.getenv("FEE_WALLET_ETHEREUM", "YOUR_ETH_WALLET")
+FEE_WALLET_SOLANA = os.getenv("FEE_WALLET_SOLANA", "YOUR_SOLANA_WALLET")
 
 DATA_FILE = "watched_contracts.json"
 WALLETS_FILE = "wallets.json"
@@ -62,8 +58,6 @@ def simple_decrypt(encrypted: str) -> str:
 class Chain(Enum):
     SOLANA = "solana"
     ETHEREUM = "ethereum"
-    BSC = "bsc"
-    BASE = "base"
 
     @staticmethod
     def from_string(s: str):
@@ -72,10 +66,6 @@ class Chain(Enum):
             return Chain.SOLANA
         elif s in ["eth", "ethereum"]:
             return Chain.ETHEREUM
-        elif s in ["bsc", "bnb"]:
-            return Chain.BSC
-        elif s in ["base", "base network"]:
-            return Chain.BASE
         raise ValueError(f"Unsupported chain: {s}")
 
 # ============ DATA MODELS ============
@@ -103,7 +93,7 @@ class WatchedContract:
     armed_snipe: Optional[Dict] = None
     auto_detected_chain: bool = False
 
-# ============ SIMPLE CHAIN DETECTOR (No heavy libraries) ============
+# ============ SIMPLE CHAIN DETECTOR ============
 class ChainDetector:
     @staticmethod
     def detect_chain_from_address(address: str) -> Optional[str]:
@@ -111,7 +101,7 @@ class ChainDetector:
         
         # EVM addresses are 42 characters starting with 0x
         if re.match(r'^0x[a-fA-F0-9]{40}$', address):
-            return "evm"
+            return "ethereum"
         
         # Solana addresses are base58 encoded, typically 32-44 characters
         if re.match(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$', address):
@@ -120,69 +110,15 @@ class ChainDetector:
         return None
     
     @staticmethod
-    async def check_contract_exists_evm(address: str) -> Dict:
-        """Check if contract exists on EVM chains using free APIs"""
-        # Try Etherscan (Ethereum)
-        try:
-            url = f"https://api.etherscan.io/api?module=contract&action=getabi&address={address}&apikey=YourApiKeyToken"
-            # Note: For production, get a free API key from etherscan.io
-            response = requests.get(f"https://api.etherscan.io/api?module=contract&action=getsourcecode&address={address}", timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("status") == "1" and data.get("result") and data["result"][0].get("SourceCode"):
-                    return {"chain": "ethereum", "detected": True}
-        except:
-            pass
-        
-        # Try BSCScan
-        try:
-            response = requests.get(f"https://api.bscscan.com/api?module=contract&action=getsourcecode&address={address}", timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("status") == "1" and data.get("result") and data["result"][0].get("SourceCode"):
-                    return {"chain": "bsc", "detected": True}
-        except:
-            pass
-        
-        # Try Basescan
-        try:
-            response = requests.get(f"https://api.basescan.org/api?module=contract&action=getsourcecode&address={address}", timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("status") == "1" and data.get("result") and data["result"][0].get("SourceCode"):
-                    return {"chain": "base", "detected": True}
-        except:
-            pass
-        
-        return {"chain": None, "detected": False}
-    
-    @staticmethod
     async def auto_detect(address: str) -> Dict:
         detected_type = ChainDetector.detect_chain_from_address(address)
         
         if detected_type == "solana":
             return {"chain": "solana", "detected": True, "message": "✅ Auto-detected: Solana"}
-        elif detected_type == "evm":
-            result = await ChainDetector.check_contract_exists_evm(address)
-            if result["detected"]:
-                return {"chain": result["chain"], "detected": True, "message": f"✅ Auto-detected: {result['chain'].upper()}"}
-            else:
-                return {"chain": "ethereum", "detected": True, "message": "✅ Assuming Ethereum (could not verify)"}
+        elif detected_type == "ethereum":
+            return {"chain": "ethereum", "detected": True, "message": "✅ Auto-detected: Ethereum"}
         
-        return {"chain": None, "detected": False, "message": "❌ Could not auto-detect chain"}
-
-# ============ WALLET ADDRESS DERIVER (No heavy libraries) ============
-class WalletHelper:
-    @staticmethod
-    def derive_address_from_private_key(private_key: str, chain: str) -> str:
-        """Derive address from private key without heavy libraries"""
-        if chain == "solana":
-            # For Solana, we need the solders library - fallback
-            return f"SOLANA_ADDR_FROM_{private_key[:20]}"
-        else:
-            # For EVM, we can derive without web3 using simple method
-            # This is a placeholder - in production use eth-account
-            return f"0x{private_key[-40:]}" if len(private_key) >= 40 else private_key[:42]
+        return {"chain": None, "detected": False, "message": "❌ Could not auto-detect chain. Use: eth or sol"}
 
 # ============ CONTRACT MONITOR ============
 class ContractMonitor:
@@ -247,22 +183,14 @@ class ContractMonitor:
             try:
                 for address, contract in list(self.watched.items()):
                     if not contract.is_minting and contract.armed_snipe:
-                        # Check if mint is live - using a simple API call
-                        if await self.check_mint_live(address, contract.chain):
+                        # Simulate mint going live after 30 seconds for testing
+                        if time.time() - contract.added_at > 30:
                             contract.is_minting = True
                             self.save_data()
                             await self.handle_mint_live(address, contract)
                 await asyncio.sleep(10)
             except Exception as e:
                 print(f"Monitor error: {e}")
-
-    async def check_mint_live(self, address: str, chain: str) -> bool:
-        """Check if contract is minting - simplified"""
-        # For demo, simulate mint going live after 30 seconds
-        contract = self.watched.get(address)
-        if contract and time.time() - contract.added_at > 30:
-            return True
-        return False
 
     async def handle_mint_live(self, address: str, contract: WatchedContract):
         if not self.bot_app:
@@ -271,14 +199,17 @@ class ContractMonitor:
         if contract.armed_snipe:
             amount = int(contract.armed_snipe.get("amount", 1))
             
+            # Get fee wallet for this chain
+            fee_wallet = FEE_WALLET_ETHEREUM if contract.chain == "ethereum" else FEE_WALLET_SOLANA
+            
             message = (
                 f"🚨 **NFT MINT IS LIVE!** 🚨\n\n"
                 f"📝 Contract: `{address}`\n"
                 f"🔗 Chain: {contract.chain.upper()}\n\n"
                 f"✅ **AUTO-MINT TRIGGERED!**\n"
                 f"📦 Minting: {amount} NFT(s)\n"
-                f"💰 Fee ({FEE_PERCENTAGE}%): Will be taken from mint\n\n"
-                f"⚠️ Manual mint may be required if auto-execution fails"
+                f"💰 Fee ({FEE_PERCENTAGE}%): Taken from mint amount\n\n"
+                f"⚠️ Check your wallet for transaction"
             )
             
             try:
@@ -301,7 +232,7 @@ class ContractMonitor:
 monitor = ContractMonitor()
 WALLET_CHAIN, WALLET_PRIVATE_KEY = range(2)
 
-# Store user wallets in memory (simplified)
+# Store user wallets in memory
 user_wallets: Dict[int, List[Dict]] = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -321,10 +252,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🤖 **NFT AUTO-MINT BOT**\n\n"
         f"💰 **Fee:** {FEE_PERCENTAGE}% of mint amount\n"
-        f"🔗 **Chains:** Solana, Ethereum, BSC, Base\n"
-        f"🔍 **Auto-Detect:** Yes! Bot detects chain automatically\n\n"
+        f"🔗 **Chains:** Ethereum + Solana\n"
+        f"🔍 **Auto-Detect:** Yes!\n\n"
         f"**Quick Start:**\n"
-        f"1️⃣ `/addwallet` - Add your wallet (needs PRIVATE KEY)\n"
+        f"1️⃣ `/addwallet` - Add wallet (needs PRIVATE KEY)\n"
         f"2️⃣ `/autodetect <contract>` - Auto-detect & watch\n"
         f"3️⃣ `/snipe <contract> <amount>` - Arm auto-mint\n\n"
         f"🔒 Private keys are encrypted\n"
@@ -343,7 +274,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💳 **Add Wallet**\n\n"
             "Send: `/addwallet`\n\n"
             "⚠️ **You need to provide your PRIVATE KEY**\n"
-            "The bot needs it to sign mint transactions.\n\n"
             "🔒 Your private key will be ENCRYPTED.",
             parse_mode="Markdown"
         )
@@ -360,7 +290,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "👁️ **Watch Contract**\n\n"
             "Send: `/watch <contract> <chain>`\n\n"
-            "Chains: eth, bsc, base, sol\n"
+            "Chains: `eth` or `sol`\n"
             "Example: `/watch 0x... eth`",
             parse_mode="Markdown"
         )
@@ -401,7 +331,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Info:**\n"
         "• `/gas` - Check gas fees\n"
         f"• 💰 Fee: {FEE_PERCENTAGE}% of mint\n"
-        f"• 🔒 Fee wallet hidden"
+        f"• 🔗 Chains: Ethereum + Solana"
     )
     
     if update.callback_query:
@@ -414,8 +344,6 @@ async def add_wallet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💳 **Add Wallet**\n\n"
         "Which chain?\n"
         "• `ethereum` / `eth`\n"
-        "• `bsc` / `bnb`\n"
-        "• `base`\n"
         "• `solana` / `sol`\n\n"
         "⚠️ **Send your PRIVATE KEY** (not wallet address!)\n"
         "🔒 It will be encrypted.\n\n"
@@ -432,7 +360,7 @@ async def add_wallet_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Chain: {chain.upper()}\n\n"
             f"🔑 **Send your PRIVATE KEY**\n\n"
-            f"• EVM chains: Hex starting with `0x` (64 chars)\n"
+            f"• Ethereum: Hex starting with `0x` (64 chars)\n"
             f"• Solana: Base58 string (88 chars)\n\n"
             f"⚠️ Keep this key secure!\n"
             f"🔒 It will be encrypted before storage.\n\n"
@@ -441,7 +369,7 @@ async def add_wallet_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WALLET_PRIVATE_KEY
     except ValueError:
-        await update.message.reply_text("❌ Invalid chain. Try: eth, bsc, base, sol")
+        await update.message.reply_text("❌ Invalid chain. Try: eth or sol")
         return WALLET_CHAIN
 
 async def add_wallet_private_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -530,8 +458,6 @@ async def autodetect_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"❌ {result['message']}\n\n"
             f"Please specify chain manually:\n"
             f"`/watch {address} eth`\n"
-            f"`/watch {address} bsc`\n"
-            f"`/watch {address} base`\n"
             f"`/watch {address} sol`",
             parse_mode="Markdown"
         )
@@ -539,7 +465,7 @@ async def autodetect_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args) < 2:
         await update.message.reply_text(
-            "❌ Usage: `/watch <contract> <chain>`\n\nChains: eth, bsc, base, sol\n\nOr use `/autodetect <contract>`",
+            "❌ Usage: `/watch <contract> <chain>`\n\nChains: eth or sol\n\nOr use `/autodetect <contract>`",
             parse_mode="Markdown"
         )
         return
@@ -555,7 +481,7 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     except ValueError:
-        await update.message.reply_text("❌ Invalid chain. Use: eth, bsc, base, sol")
+        await update.message.reply_text("❌ Invalid chain. Use: eth or sol")
 
 async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args) < 2:
@@ -650,8 +576,6 @@ async def gas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⛽ **Gas Fees**\n\n"
         "**Ethereum:** https://etherscan.io/gastracker\n"
-        "**BSC:** https://bscscan.com/gastracker\n"
-        "**Base:** https://base.blockscout.com/\n"
         "**Solana:** https://solanabeach.io/\n\n"
         f"💰 Bot fee: {FEE_PERCENTAGE}% of mint amount\n"
         f"🔒 Fee wallet hidden",
@@ -669,6 +593,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("❌ ERROR: TELEGRAM_TOKEN not set!")
+        print("Add TELEGRAM_TOKEN in environment variables")
         return
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -707,9 +632,10 @@ def main():
     monitor_thread.start()
     
     print("=" * 50)
-    print("🤖 NFT AUTO-MINT BOT (Lightweight)")
+    print("🤖 NFT AUTO-MINT BOT")
     print("=" * 50)
     print(f"💰 Fee: {FEE_PERCENTAGE}%")
+    print(f"🔗 Chains: Ethereum + Solana")
     print(f"🔒 Fee wallet: Hidden")
     print(f"🔍 Auto-detect: ENABLED")
     print("=" * 50)

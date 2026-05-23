@@ -3,3 +3,4 @@ eth-account==0.10.0
 requests==2.31.0
 aiohttp==3.9.5
 python-dotenv==1.0.0
+websockets==12.0

@@ -6,7 +6,6 @@ import re
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
-from enum import Enum
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -27,7 +26,6 @@ ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "default-key")
 DATA_FILE = "watched_projects.json"
 WALLETS_FILE = "wallets.json"
 
-# OpenSea API
 OPENSEA_API = "https://api.opensea.io/api/v2"
 
 # ============ ENCRYPTION ============
@@ -74,7 +72,7 @@ class Wallet:
     added_by: int
     added_at: float
 
-# ============ API INTEGRATIONS (HIDDEN FROM USERS) ============
+# ============ API INTEGRATIONS ============
 class OpenSeaAPI:
     @staticmethod
     async def get_collection_stats(contract_address: str) -> Dict:
@@ -250,12 +248,6 @@ class ProjectMonitor:
         while self.monitoring:
             for contract_addr, project in self.projects.items():
                 await self.update_project_stats(contract_addr)
-                
-                if project.armed_snipe:
-                    # Check if stage is active (simplified)
-                    # In production, you'd check the actual contract
-                    pass
-            
             await asyncio.sleep(30)
 
     async def start_monitoring(self, bot_app):
@@ -276,7 +268,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎯 Set Target", callback_data="set_target")],
         [InlineKeyboardButton("🎯 Auto-Mint", callback_data="arm_snipe")],
         [InlineKeyboardButton("📋 My Projects", callback_data="list_projects")],
-        [InlineKeyboardButton("🔄 Refresh Stats", callback_data="refresh")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel_snipe")],
         [InlineKeyboardButton("⛽ Gas", callback_data="gas")],
     ]
@@ -427,7 +419,7 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ **Tracking {project_name}!**\n\n"
             f"📝 Contract: `{contract[:15]}...`\n\n"
             f"📊 Add mint stages with `/addstage {contract[:15]}... <stage> <price> <max>`\n\n"
-            f**"Stages:** GTD, WL, FCFS, Presale\n\n"
+            "**Stages:** GTD, WL, FCFS, Presale\n\n"
             f"Example: `/addstage {contract[:15]}... WL 0.08 2`",
             parse_mode="Markdown"
         )
@@ -533,7 +525,6 @@ async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Project not tracked.", parse_mode="Markdown")
         return
     
-    # Check if stage exists
     stage_exists = any(s.get("name", "").upper() == stage for s in monitor.projects[contract].stages)
     if not stage_exists:
         await update.message.reply_text(f"❌ Stage '{stage}' not found. Add it with `/addstage`", parse_mode="Markdown")

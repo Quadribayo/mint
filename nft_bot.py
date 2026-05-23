@@ -1,10 +1,8 @@
 import os
 import asyncio
-import threading
 import time
 import json
 import re
-from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -17,23 +15,23 @@ from telegram.ext import (
 
 import requests
 import aiohttp
+from eth_account import Account
 
 # ============ CONFIGURATION ============
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 FEE_PERCENTAGE = 1.0
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "default-key-change-me")
 
-# Your fee wallets (where the 1% fee goes)
-FEE_WALLET_ETHEREUM = os.getenv("FEE_WALLET_ETHEREUM", "YOUR_ETH_WALLET")
-FEE_WALLET_SOLANA = os.getenv("FEE_WALLET_SOLANA", "YOUR_SOLANA_WALLET")
+# API Keys (set these in Railway/FPS.ms environment variables)
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "")
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 
 DATA_FILE = "watched_contracts.json"
 WALLETS_FILE = "wallets.json"
 
-# Simple encryption for private keys
+# ============ ENCRYPTION ============
 import hashlib
 import base64
-
-ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "default-key-change-me")
 
 def simple_encrypt(text: str) -> str:
     if not text:
@@ -54,34 +52,19 @@ def simple_decrypt(encrypted: str) -> str:
         result.append(chr(ord(char) ^ key[i % len(key)]))
     return "".join(result)
 
-# ============ CHAIN ENUM ============
-class Chain(Enum):
-    SOLANA = "solana"
-    ETHEREUM = "ethereum"
-
-    @staticmethod
-    def from_string(s: str):
-        s = s.lower()
-        if s in ["sol", "solana"]:
-            return Chain.SOLANA
-        elif s in ["eth", "ethereum"]:
-            return Chain.ETHEREUM
-        raise ValueError(f"Unsupported chain: {s}")
-
 # ============ DATA MODELS ============
 @dataclass
-class Wallet:
-    chain: str
-    address: str
-    private_key_encrypted: str
-    added_by: int
-    added_at: float
+class GasConfig:
+    strategy: str  # normal, priority, custom, auto
+    max_gwei: Optional[float] = None
+    priority_multiplier: float = 1.2
     
-    def get_private_key(self) -> str:
-        return simple_decrypt(self.private_key_encrypted)
+    def to_dict(self):
+        return {"strategy": self.strategy, "max_gwei": self.max_gwei, "priority_multiplier": self.priority_multiplier}
     
-    def set_private_key(self, private_key: str):
-        self.private_key_encrypted = simple_encrypt(private_key)
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**data)
 
 @dataclass
 class WatchedContract:
@@ -91,34 +74,144 @@ class WatchedContract:
     added_at: float
     is_minting: bool = False
     armed_snipe: Optional[Dict] = None
-    auto_detected_chain: bool = False
+    gas_config: Optional[Dict] = None
+    max_gas_usd: Optional[float] = None
+    required_nfts: List[str] = None  # NFT contracts user must hold
+    
+    def __post_init__(self):
+        if self.required_nfts is None:
+            self.required_nfts = []
 
-# ============ SIMPLE CHAIN DETECTOR ============
-class ChainDetector:
+# ============ WALLET ELIGIBILITY CHECKER ============
+class EligibilityChecker:
     @staticmethod
-    def detect_chain_from_address(address: str) -> Optional[str]:
-        address = address.strip()
+    async def check_holdings(wallet_address: str, required_nft_contracts: List[str]) -> Dict:
+        """Check if wallet holds any of the required NFTs using Alchemy API"""
+        if not required_nft_contracts:
+            return {"eligible": True, "message": "✅ No eligibility requirements"}
         
-        # EVM addresses are 42 characters starting with 0x
-        if re.match(r'^0x[a-fA-F0-9]{40}$', address):
-            return "ethereum"
+        if not ALCHEMY_API_KEY:
+            return {
+                "eligible": True, 
+                "message": "⚠️ No Alchemy API key set - eligibility check skipped. Add ALCHEMY_API_KEY to enable."
+            }
         
-        # Solana addresses are base58 encoded, typically 32-44 characters
-        if re.match(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$', address):
-            return "solana"
-        
-        return None
+        try:
+            async with aiohttp.ClientSession() as session:
+                required_lower = [c.lower() for c in required_nft_contracts]
+                
+                url = f"https://eth-mainnet.g.alchemy.com/nft/v2/{ALCHEMY_API_KEY}/getNFTs"
+                params = {
+                    "owner": wallet_address,
+                    "withMetadata": "false",
+                    "pageSize": "100"
+                }
+                
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        owned_nfts = data.get("ownedNfts", [])
+                        
+                        held_nfts = []
+                        for nft in owned_nfts:
+                            contract_addr = nft.get("contract", {}).get("address", "").lower()
+                            if contract_addr in required_lower:
+                                held_nfts.append(contract_addr)
+                        
+                        if held_nfts:
+                            return {
+                                "eligible": True,
+                                "message": f"✅ Eligible! Found {len(held_nfts)} required NFT(s) in your wallet."
+                            }
+                        else:
+                            return {
+                                "eligible": False,
+                                "message": f"❌ Not eligible. You don't hold any of the required NFT(s).\nRequired: {len(required_nft_contracts)} NFT contract(s)"
+                            }
+                    else:
+                        return {"eligible": False, "message": "⚠️ Could not verify eligibility (API error)"}
+        except Exception as e:
+            print(f"Eligibility check error: {e}")
+            return {"eligible": False, "message": f"⚠️ Error checking eligibility: {str(e)}"}
     
     @staticmethod
-    async def auto_detect(address: str) -> Dict:
-        detected_type = ChainDetector.detect_chain_from_address(address)
+    async def get_nft_balance(wallet_address: str, nft_contract: str) -> int:
+        """Get the number of NFTs owned for a specific contract"""
+        if not ALCHEMY_API_KEY:
+            return 0
         
-        if detected_type == "solana":
-            return {"chain": "solana", "detected": True, "message": "✅ Auto-detected: Solana"}
-        elif detected_type == "ethereum":
-            return {"chain": "ethereum", "detected": True, "message": "✅ Auto-detected: Ethereum"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://eth-mainnet.g.alchemy.com/nft/v2/{ALCHEMY_API_KEY}/getNFTs"
+                params = {
+                    "owner": wallet_address,
+                    "contractAddresses": nft_contract,
+                    "withMetadata": "false"
+                }
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return len(data.get("ownedNfts", []))
+        except:
+            pass
+        return 0
+
+# ============ GAS MANAGER ============
+class GasManager:
+    @staticmethod
+    async def get_eth_gas_prices() -> Dict:
+        try:
+            response = requests.get("https://api.etherscan.io/api?module=gastracker&action=gasoracle", timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "1":
+                    gas_data = data["result"]
+                    return {
+                        "slow": int(gas_data["SafeGasPrice"]),
+                        "standard": int(gas_data["ProposeGasPrice"]),
+                        "fast": int(gas_data["FastGasPrice"]),
+                        "base_fee": int(gas_data["suggestBaseFee"]),
+                        "success": True
+                    }
+        except:
+            pass
+        return {"slow": 30, "standard": 40, "fast": 50, "base_fee": 25, "success": True}
+    
+    @staticmethod
+    def gwei_to_usd(gwei: int, gas_limit: int = 150000) -> float:
+        eth_price_usd = 3000
+        eth_amount = (gwei * gas_limit) / 1e9
+        return round(eth_amount * eth_price_usd, 2)
+    
+    @staticmethod
+    def usd_to_gwei(usd: float, gas_limit: int = 150000) -> int:
+        eth_price_usd = 3000
+        max_eth = usd / eth_price_usd
+        return int((max_eth * 1e9) / gas_limit)
+    
+    @staticmethod
+    def calculate_gas_price(strategy: str, current_prices: Dict, custom_gwei: float = None, priority_mult: float = 1.2) -> Dict:
+        if strategy == "normal":
+            gas_gwei = current_prices.get("standard", 40)
+            description = f"Normal gas ({gas_gwei} Gwei)"
+        elif strategy == "priority":
+            base_gas = current_prices.get("fast", 50)
+            gas_gwei = int(base_gas * priority_mult)
+            description = f"Priority gas ({gas_gwei} Gwei) - {int((priority_mult-1)*100)}% premium"
+        elif strategy == "custom":
+            gas_gwei = custom_gwei if custom_gwei else 100
+            description = f"Custom gas ({gas_gwei} Gwei)"
+        else:
+            fast_gas = current_prices.get("fast", 50)
+            if fast_gas < 50:
+                gas_gwei = int(fast_gas * 1.3)
+                description = f"Auto-aggressive ({gas_gwei} Gwei)"
+            else:
+                gas_gwei = fast_gas
+                description = f"Auto-standard ({gas_gwei} Gwei)"
         
-        return {"chain": None, "detected": False, "message": "❌ Could not auto-detect chain. Use: eth or sol"}
+        usd_cost = GasManager.gwei_to_usd(gas_gwei)
+        return {"gas_gwei": gas_gwei, "description": description, "usd_cost": usd_cost, "strategy": strategy}
 
 # ============ CONTRACT MONITOR ============
 class ContractMonitor:
@@ -127,6 +220,8 @@ class ContractMonitor:
         self.load_data()
         self.monitoring = False
         self.bot_app = None
+        self.gas_manager = GasManager()
+        self.eligibility = EligibilityChecker()
 
     def load_data(self):
         if os.path.exists(DATA_FILE):
@@ -134,17 +229,26 @@ class ContractMonitor:
                 with open(DATA_FILE, 'r') as f:
                     data = json.load(f)
                     for addr, contract_data in data.items():
+                        if contract_data.get("gas_config"):
+                            contract_data["gas_config"] = GasConfig.from_dict(contract_data["gas_config"])
+                        if contract_data.get("required_nfts") is None:
+                            contract_data["required_nfts"] = []
                         self.watched[addr] = WatchedContract(**contract_data)
-                print(f"✅ Loaded {len(self.watched)} watched contracts")
+                print(f"✅ Loaded {len(self.watched)} contracts")
             except Exception as e:
                 print(f"Error loading data: {e}")
 
     def save_data(self):
-        data = {addr: asdict(contract) for addr, contract in self.watched.items()}
+        data = {}
+        for addr, contract in self.watched.items():
+            contract_dict = asdict(contract)
+            if contract.gas_config:
+                contract_dict["gas_config"] = contract.gas_config.to_dict()
+            data[addr] = contract_dict
         with open(DATA_FILE, 'w') as f:
             json.dump(data, f, indent=2)
 
-    def add_contract(self, address: str, chain: str, user_id: int, auto_detected: bool = False) -> bool:
+    def add_contract(self, address: str, chain: str, user_id: int) -> bool:
         address = address.lower().strip()
         if address in self.watched:
             return False
@@ -153,113 +257,97 @@ class ContractMonitor:
             chain=chain,
             added_by=user_id,
             added_at=time.time(),
-            auto_detected_chain=auto_detected
+            required_nfts=[]
         )
         self.save_data()
         return True
-    
-    def remove_contract(self, address: str) -> bool:
-        address = address.lower().strip()
-        if address in self.watched:
-            del self.watched[address]
+
+    def set_gas_strategy(self, address: str, strategy: str, custom_gwei: float = None, priority_mult: float = 1.2) -> bool:
+        if address not in self.watched:
+            return False
+        self.watched[address].gas_config = GasConfig(strategy=strategy, max_gwei=custom_gwei, priority_multiplier=priority_mult)
+        self.save_data()
+        return True
+
+    def set_max_gas_usd(self, address: str, max_usd: float) -> bool:
+        if address not in self.watched:
+            return False
+        self.watched[address].max_gas_usd = max_usd
+        self.save_data()
+        return True
+
+    def set_eligibility_nft(self, address: str, nft_contract: str) -> bool:
+        if address not in self.watched:
+            return False
+        if self.watched[address].required_nfts is None:
+            self.watched[address].required_nfts = []
+        if nft_contract.lower() not in [x.lower() for x in self.watched[address].required_nfts]:
+            self.watched[address].required_nfts.append(nft_contract)
             self.save_data()
             return True
         return False
 
-    async def auto_detect_and_add(self, address: str, user_id: int) -> Dict:
-        result = await ChainDetector.auto_detect(address)
-        
-        if result["detected"] and result["chain"]:
-            self.add_contract(address, result["chain"], user_id, auto_detected=True)
-            result["added"] = True
-        else:
-            result["added"] = False
-        
-        return result
+    def remove_eligibility_nft(self, address: str, nft_contract: str) -> bool:
+        if address in self.watched and self.watched[address].required_nfts:
+            original_len = len(self.watched[address].required_nfts)
+            self.watched[address].required_nfts = [x for x in self.watched[address].required_nfts if x.lower() != nft_contract.lower()]
+            if len(self.watched[address].required_nfts) != original_len:
+                self.save_data()
+                return True
+        return False
 
-    async def monitor_contracts(self):
-        """Simple monitoring loop - checks every 10 seconds"""
-        while self.monitoring:
-            try:
-                for address, contract in list(self.watched.items()):
-                    if not contract.is_minting and contract.armed_snipe:
-                        # Simulate mint going live after 30 seconds for testing
-                        if time.time() - contract.added_at > 30:
-                            contract.is_minting = True
-                            self.save_data()
-                            await self.handle_mint_live(address, contract)
-                await asyncio.sleep(10)
-            except Exception as e:
-                print(f"Monitor error: {e}")
-
-    async def handle_mint_live(self, address: str, contract: WatchedContract):
-        if not self.bot_app:
-            return
-        
-        if contract.armed_snipe:
-            amount = int(contract.armed_snipe.get("amount", 1))
-            
-            # Get fee wallet for this chain
-            fee_wallet = FEE_WALLET_ETHEREUM if contract.chain == "ethereum" else FEE_WALLET_SOLANA
-            
-            message = (
-                f"🚨 **NFT MINT IS LIVE!** 🚨\n\n"
-                f"📝 Contract: `{address}`\n"
-                f"🔗 Chain: {contract.chain.upper()}\n\n"
-                f"✅ **AUTO-MINT TRIGGERED!**\n"
-                f"📦 Minting: {amount} NFT(s)\n"
-                f"💰 Fee ({FEE_PERCENTAGE}%): Taken from mint amount\n\n"
-                f"⚠️ Check your wallet for transaction"
-            )
-            
-            try:
-                await self.bot_app.bot.send_message(
-                    chat_id=contract.armed_snipe["user_id"],
-                    text=message,
-                    parse_mode="Markdown"
-                )
-                print(f"✅ Mint alert sent for {address}")
-            except Exception as e:
-                print(f"Failed to send message: {e}")
+    async def check_eligibility(self, address: str, wallet_address: str) -> Dict:
+        contract = self.watched.get(address)
+        if not contract or not contract.required_nfts:
+            return {"eligible": True, "message": "✅ No NFT requirements"}
+        return await self.eligibility.check_holdings(wallet_address, contract.required_nfts)
 
     async def start_monitoring(self, bot_app):
         self.bot_app = bot_app
         self.monitoring = True
         print("🟢 Monitoring started!")
-        await self.monitor_contracts()
 
-# ============ TELEGRAM HANDLERS ============
 monitor = ContractMonitor()
 WALLET_CHAIN, WALLET_PRIVATE_KEY = range(2)
 
-# Store user wallets in memory
+# In-memory wallet storage
 user_wallets: Dict[int, List[Dict]] = {}
 
+# ============ TELEGRAM HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("➕ Add Wallet", callback_data="addwallet")],
         [InlineKeyboardButton("👛 View Wallets", callback_data="wallets")],
-        [InlineKeyboardButton("🔍 Auto-Detect", callback_data="autodetect")],
         [InlineKeyboardButton("👁️ Watch Contract", callback_data="watch")],
         [InlineKeyboardButton("🎯 Snipe", callback_data="snipe")],
-        [InlineKeyboardButton("📋 List Contracts", callback_data="list")],
-        [InlineKeyboardButton("❌ Cancel Snipe", callback_data="cancel")],
+        [InlineKeyboardButton("⛽ Gas Strategy", callback_data="gasstrategy")],
+        [InlineKeyboardButton("🔑 Set Eligibility", callback_data="eligibility")],
+        [InlineKeyboardButton("📋 List", callback_data="list")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
         [InlineKeyboardButton("⛽ Gas Fees", callback_data="gas")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    alchemy_status = "✅" if ALCHEMY_API_KEY else "❌"
     
     await update.message.reply_text(
         f"🤖 **NFT AUTO-MINT BOT**\n\n"
         f"💰 **Fee:** {FEE_PERCENTAGE}% of mint amount\n"
-        f"🔗 **Chains:** Ethereum + Solana\n"
-        f"🔍 **Auto-Detect:** Yes!\n\n"
-        f"**Quick Start:**\n"
-        f"1️⃣ `/addwallet` - Add wallet (needs PRIVATE KEY)\n"
-        f"2️⃣ `/autodetect <contract>` - Auto-detect & watch\n"
-        f"3️⃣ `/snipe <contract> <amount>` - Arm auto-mint\n\n"
-        f"🔒 Private keys are encrypted\n"
-        f"🔒 Fee wallet is hidden from users",
+        f"🔗 **Chains:** Ethereum & Solana\n"
+        f"🔑 **Alchemy API:** {alchemy_status} (NFT eligibility)\n\n"
+        f"**Commands:**\n"
+        f"• `/addwallet` - Add wallet (needs PRIVATE KEY)\n"
+        f"• `/watch <contract> <eth/sol>` - Watch NFT\n"
+        f"• `/seteligibility <contract> <nft>` - Require holding an NFT\n"
+        f"• `/removeeligibility <contract> <nft>` - Remove requirement\n"
+        f"• `/listeligibility <contract>` - Show requirements\n"
+        f"• `/snipe <contract> <amount>` - Arm auto-mint\n"
+        f"• `/gasstrategy <contract> <normal/priority/custom/auto>`\n"
+        f"• `/gaslimit <contract> <max_usd>` - Max gas in USD\n"
+        f"• `/list` - View all settings\n"
+        f"• `/cancel <contract>` - Cancel snipe\n"
+        f"• `/gas` - Check gas fees\n\n"
+        f"🔒 Private keys encrypted | 🔑 NFT eligibility checks supported",
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
@@ -270,105 +358,71 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd = query.data
     
     if cmd == "addwallet":
-        await query.message.reply_text(
-            "💳 **Add Wallet**\n\n"
-            "Send: `/addwallet`\n\n"
-            "⚠️ **You need to provide your PRIVATE KEY**\n"
-            "🔒 Your private key will be ENCRYPTED.",
-            parse_mode="Markdown"
-        )
+        await query.message.reply_text("Send `/addwallet` then chain and PRIVATE KEY", parse_mode="Markdown")
     elif cmd == "wallets":
         await wallets_command(update, context)
-    elif cmd == "autodetect":
-        await query.message.reply_text(
-            "🔍 **Auto-Detect Chain**\n\n"
-            "Send: `/autodetect <contract_address>`\n\n"
-            "Example: `/autodetect 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0`",
-            parse_mode="Markdown"
-        )
     elif cmd == "watch":
-        await query.message.reply_text(
-            "👁️ **Watch Contract**\n\n"
-            "Send: `/watch <contract> <chain>`\n\n"
-            "Chains: `eth` or `sol`\n"
-            "Example: `/watch 0x... eth`",
-            parse_mode="Markdown"
-        )
+        await query.message.reply_text("Send `/watch <contract> <chain>`\nChains: `eth` or `sol`", parse_mode="Markdown")
     elif cmd == "snipe":
         await query.message.reply_text(
-            "🎯 **Arm Auto-Mint**\n\n"
-            "Send: `/snipe <contract> <amount>`\n\n"
-            f"Example: `/snipe 0x... 2`\n\n"
-            f"💰 Fee: {FEE_PERCENTAGE}% of mint amount",
+            "🎯 **Snipe**\n\nSend: `/snipe <contract> <amount>`\n\n"
+            "Set gas strategy with `/gasstrategy` and eligibility with `/seteligibility`",
+            parse_mode="Markdown"
+        )
+    elif cmd == "gasstrategy":
+        await query.message.reply_text(
+            "⛽ **Gas Strategies**\n\n"
+            "`/gasstrategy <contract> normal`\n"
+            "`/gasstrategy <contract> priority [multiplier]`\n"
+            "`/gasstrategy <contract> custom <gwei>`\n"
+            "`/gasstrategy <contract> auto`\n\n"
+            "**Examples:**\n"
+            "`/gasstrategy 0x... priority 1.5` (50% premium)\n"
+            "`/gasstrategy 0x... custom 200` (use 200 Gwei)",
+            parse_mode="Markdown"
+        )
+    elif cmd == "eligibility":
+        await query.message.reply_text(
+            "🔑 **NFT Eligibility**\n\n"
+            "`/seteligibility <contract> <nft_contract_address>`\n"
+            "Bot will check if your wallet holds that NFT before sniping.\n\n"
+            "`/removeeligibility <contract> <nft_contract>` - Remove requirement\n"
+            "`/listeligibility <contract>` - Show requirements",
             parse_mode="Markdown"
         )
     elif cmd == "list":
         await list_command(update, context)
     elif cmd == "cancel":
-        await query.message.reply_text(
-            "❌ **Cancel Auto-Mint**\n\n"
-            "Send: `/cancel <contract_address>`",
-            parse_mode="Markdown"
-        )
+        await query.message.reply_text("Send `/cancel <contract_address>`", parse_mode="Markdown")
     elif cmd == "gas":
         await gas_command(update, context)
-    elif cmd == "help":
-        await help_command(update, context)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "📚 **Commands**\n\n"
-        "**Wallet:**\n"
-        "• `/addwallet` - Add wallet (needs PRIVATE KEY)\n"
-        "• `/wallets` - View your wallets\n\n"
-        "**Monitoring:**\n"
-        "• `/autodetect <contract>` - Auto-detect chain\n"
-        "• `/watch <contract> <chain>` - Manual watch\n"
-        "• `/list` - View watched contracts\n\n"
-        "**Auto-Mint:**\n"
-        "• `/snipe <contract> <amount>` - Arm auto-mint\n"
-        "• `/cancel <contract>` - Cancel snipe\n\n"
-        "**Info:**\n"
-        "• `/gas` - Check gas fees\n"
-        f"• 💰 Fee: {FEE_PERCENTAGE}% of mint\n"
-        f"• 🔗 Chains: Ethereum + Solana"
-    )
-    
-    if update.callback_query:
-        await update.callback_query.message.edit_text(help_text, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(help_text, parse_mode="Markdown")
-
+# ============ WALLET HANDLERS ============
 async def add_wallet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "💳 **Add Wallet**\n\n"
-        "Which chain?\n"
-        "• `ethereum` / `eth`\n"
-        "• `solana` / `sol`\n\n"
-        "⚠️ **Send your PRIVATE KEY** (not wallet address!)\n"
-        "🔒 It will be encrypted.\n\n"
-        "Send /cancel to abort.",
+        "💳 **Add Wallet**\n\nWhich chain?\n• `ethereum` / `eth`\n• `solana` / `sol`\n\n"
+        "⚠️ Send your **PRIVATE KEY** (not wallet address)\n🔒 It will be encrypted.\n\nSend /cancel to abort.",
         parse_mode="Markdown"
     )
     return WALLET_CHAIN
 
 async def add_wallet_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chain_input = update.message.text.lower()
-    try:
-        chain = Chain.from_string(chain_input).value
-        context.user_data['wallet_chain'] = chain
+    if chain_input in ["eth", "ethereum"]:
+        context.user_data['wallet_chain'] = "ethereum"
         await update.message.reply_text(
-            f"✅ Chain: {chain.upper()}\n\n"
-            f"🔑 **Send your PRIVATE KEY**\n\n"
-            f"• Ethereum: Hex starting with `0x` (64 chars)\n"
-            f"• Solana: Base58 string (88 chars)\n\n"
-            f"⚠️ Keep this key secure!\n"
-            f"🔒 It will be encrypted before storage.\n\n"
-            f"Example: `0x123abc...`",
+            "✅ Chain: ETHEREUM\n\n🔑 Send your **PRIVATE KEY** (hex starting with 0x, 64 characters)\n\n🔒 It will be encrypted.",
             parse_mode="Markdown"
         )
         return WALLET_PRIVATE_KEY
-    except ValueError:
+    elif chain_input in ["sol", "solana"]:
+        context.user_data['wallet_chain'] = "solana"
+        await update.message.reply_text(
+            "✅ Chain: SOLANA\n\n🔑 Send your **PRIVATE KEY** (Base58 encoded)\n\n🔒 It will be encrypted.",
+            parse_mode="Markdown"
+        )
+        return WALLET_PRIVATE_KEY
+    else:
         await update.message.reply_text("❌ Invalid chain. Try: eth or sol")
         return WALLET_CHAIN
 
@@ -377,16 +431,21 @@ async def add_wallet_private_key(update: Update, context: ContextTypes.DEFAULT_T
     chain = context.user_data.get('wallet_chain')
     
     if not private_key or len(private_key) < 30:
-        await update.message.reply_text("❌ Invalid private key. Please send a valid private key.")
+        await update.message.reply_text("❌ Invalid private key.")
         return WALLET_PRIVATE_KEY
     
-    # Derive address from private key (simplified)
-    if chain == "solana":
-        address = f"SOL_{private_key[-20:]}"
-    else:
-        address = f"0x{private_key[-40:]}" if len(private_key) >= 40 else private_key[:42]
+    try:
+        if chain == "ethereum":
+            # ✅ CORRECT: Derive address from private key
+            account = Account.from_key(private_key)
+            address = account.address
+        else:
+            # Solana placeholder
+            address = f"SOLANA_{private_key[-20:]}"
+    except Exception as e:
+        await update.message.reply_text(f"❌ Invalid private key for {chain.upper()}: {str(e)}")
+        return WALLET_PRIVATE_KEY
     
-    # Store wallet
     user_id = update.effective_user.id
     if user_id not in user_wallets:
         user_wallets[user_id] = []
@@ -399,95 +458,228 @@ async def add_wallet_private_key(update: Update, context: ContextTypes.DEFAULT_T
     })
     
     await update.message.reply_text(
-        f"✅ **Wallet Added!**\n\n"
-        f"🔗 Chain: {chain.upper()}\n"
-        f"📫 Address: `{address[:15]}...{address[-8:]}`\n"
-        f"🔒 Private key: Encrypted\n\n"
-        f"💡 You can now watch contracts and snipe!",
+        f"✅ **Wallet Added!**\n\n🔗 Chain: {chain.upper()}\n📫 Address: `{address}`\n🔒 Private key: Encrypted\n\n"
+        f"💡 Use `/watch` to monitor contracts!\n🔑 Use `/seteligibility` to add NFT requirements!",
         parse_mode="Markdown"
     )
-    
     return ConversationHandler.END
 
 async def wallets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     wallets = user_wallets.get(user_id, [])
-    
     if not wallets:
-        await update.message.reply_text(
-            "💼 No wallets.\nUse `/addwallet` to add one.\n\n"
-            "⚠️ **You need your PRIVATE KEY** (not just wallet address)",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("💼 No wallets. Use `/addwallet`", parse_mode="Markdown")
         return
-    
     message = "💼 **Your Wallets**\n\n"
-    for wallet in wallets:
-        message += f"**{wallet['chain'].upper()}**\n📫 `{wallet['address'][:15]}...`\n🔒 Encrypted\n\n"
-    
+    for w in wallets:
+        message += f"**{w['chain'].upper()}**\n📫 `{w['address']}`\n🔒 Encrypted\n\n"
     await update.message.reply_text(message, parse_mode="Markdown")
 
-async def autodetect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "🔍 **Auto-Detect**\n\nUsage: `/autodetect <contract_address>`\n\nExample: `/autodetect 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0`",
-            parse_mode="Markdown"
-        )
+# ============ CONTRACT HANDLERS ============
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("❌ Usage: `/watch <contract> <chain>`\nChains: eth or sol\n\nExample: `/watch 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0 eth`", parse_mode="Markdown")
         return
-    
-    address = context.args[0].strip()
-    
-    status_msg = await update.message.reply_text(
-        f"🔍 Detecting chain for `{address[:20]}...`...",
-        parse_mode="Markdown"
-    )
-    
-    result = await monitor.auto_detect_and_add(address, update.effective_user.id)
-    
-    if result["detected"]:
-        await status_msg.edit_text(
-            f"{result['message']}\n\n"
-            f"📝 Contract: `{address}`\n"
-            f"🔗 Chain: {result['chain'].upper()}\n\n"
-            f"✅ Added to watchlist!\n\n"
-            f"🎯 Use `/snipe {address[:15]}... <amount>` to arm auto-mint!",
+    address = context.args[0]
+    chain_input = context.args[1].lower()
+    if chain_input in ["eth", "ethereum"]:
+        chain = "ethereum"
+    elif chain_input in ["sol", "solana"]:
+        chain = "solana"
+    else:
+        await update.message.reply_text("❌ Invalid chain. Use: eth or sol")
+        return
+    if monitor.add_contract(address, chain, update.effective_user.id):
+        await update.message.reply_text(
+            f"✅ **Watching!**\n📝 `{address[:20]}...`\n🔗 {chain.upper()}\n\n"
+            f"🎯 Set gas strategy: `/gasstrategy {address[:15]}...`\n"
+            f"🔑 Set eligibility: `/seteligibility {address[:15]}... <nft_contract>`\n"
+            f"⚡ Then `/snipe {address[:15]}... <amount>`",
             parse_mode="Markdown"
         )
     else:
-        await status_msg.edit_text(
-            f"❌ {result['message']}\n\n"
-            f"Please specify chain manually:\n"
-            f"`/watch {address} eth`\n"
-            f"`/watch {address} sol`",
+        await update.message.reply_text("⚠️ Already watching.")
+
+async def seteligibility_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "🔑 **Set NFT Eligibility**\n\n"
+            "Usage: `/seteligibility <contract> <nft_contract_address>`\n\n"
+            "**Example:**\n"
+            "`/seteligibility 0xMintContract 0xBd3531dA5CF5857e7CfAA92426877b022e612cf8`\n\n"
+            "Bot will check if your wallet holds this NFT before allowing a snipe!\n\n"
+            "💡 Get Alchemy API key for accurate checks (free at alchemy.com)",
             parse_mode="Markdown"
         )
-
-async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or len(context.args) < 2:
+        return
+    address = context.args[0].lower().strip()
+    nft_addr = context.args[1].strip()
+    if address not in monitor.watched:
+        await update.message.reply_text("❌ Contract not watched. Use `/watch` first.", parse_mode="Markdown")
+        return
+    if monitor.set_eligibility_nft(address, nft_addr):
         await update.message.reply_text(
-            "❌ Usage: `/watch <contract> <chain>`\n\nChains: eth or sol\n\nOr use `/autodetect <contract>`",
+            f"🔑 **Eligibility Requirement Set!**\n\n"
+            f"📝 Contract: `{address[:15]}...`\n"
+            f"🎫 Required NFT: `{nft_addr[:20]}...`\n\n"
+            f"⚡ Bot will check if your wallet holds this NFT before sniping!",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("⚠️ Could not set eligibility (already present?)")
+
+async def removeeligibility_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Usage: `/removeeligibility <contract> <nft_contract_address>`", parse_mode="Markdown")
+        return
+    address = context.args[0].lower().strip()
+    nft_addr = context.args[1].strip()
+    if monitor.remove_eligibility_nft(address, nft_addr):
+        await update.message.reply_text(f"✅ Removed NFT requirement for `{nft_addr[:20]}...`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Not found or already removed")
+
+async def listeligibility_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Usage: `/listeligibility <contract>`", parse_mode="Markdown")
+        return
+    address = context.args[0].lower().strip()
+    contract = monitor.watched.get(address)
+    if not contract:
+        await update.message.reply_text("❌ Contract not watched.")
+        return
+    if contract.required_nfts:
+        msg = f"🔑 **Eligibility Requirements**\n\n📝 Contract: `{address[:15]}...`\n\n"
+        for nft in contract.required_nfts:
+            msg += f"• Must hold NFT: `{nft[:25]}...`\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    else:
+        await update.message.reply_text("✅ No NFT eligibility requirements set for this contract.")
+
+async def gasstrategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⛽ **Gas Strategies**\n\n"
+            "Usage: `/gasstrategy <contract> <strategy> [value]`\n\n"
+            "**Strategies:**\n"
+            "• `normal` - Standard gas (safe)\n"
+            "• `priority` - Fast gas + premium (for hyped mints)\n"
+            "• `priority 1.5` - Fast gas + 50% premium\n"
+            "• `custom 150` - Use exactly 150 Gwei\n"
+            "• `auto` - Smart automatic selection\n\n"
+            "**Examples:**\n"
+            "`/gasstrategy 0x... priority`\n"
+            "`/gasstrategy 0x... priority 2.0`\n"
+            "`/gasstrategy 0x... custom 200`",
             parse_mode="Markdown"
         )
         return
     
-    address = context.args[0]
-    chain_input = context.args[1]
+    address = context.args[0].lower().strip()
+    strategy = context.args[1].lower()
     
-    try:
-        chain = Chain.from_string(chain_input).value
-        monitor.add_contract(address, chain, update.effective_user.id)
+    if address not in monitor.watched:
+        await update.message.reply_text("❌ Contract not watched. Use `/watch` first.", parse_mode="Markdown")
+        return
+    
+    priority_mult = 1.2
+    custom_gwei = None
+    
+    if len(context.args) >= 3:
+        try:
+            value = float(context.args[2])
+            if strategy == "priority":
+                priority_mult = value
+            elif strategy == "custom":
+                custom_gwei = int(value)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid value. Must be a number.")
+            return
+    
+    if strategy == "normal":
+        monitor.set_gas_strategy(address, "normal")
+        response = "🐢 **Normal Gas Strategy**\n\nUses standard gas prices. Safe for normal mints."
+    elif strategy == "priority":
+        monitor.set_gas_strategy(address, "priority", priority_mult=priority_mult)
+        response = f"🚀 **Priority Gas Strategy**\n\nUses fast gas + {int((priority_mult-1)*100)}% premium.\nPerfect for hyped mints!"
+    elif strategy == "custom":
+        if not custom_gwei:
+            await update.message.reply_text("❌ Custom strategy requires a Gwei value: `/gasstrategy <contract> custom 150`")
+            return
+        monitor.set_gas_strategy(address, "custom", custom_gwei=custom_gwei)
+        response = f"🎯 **Custom Gas Strategy**\n\nWill use exactly {custom_gwei} Gwei.\nManual override!"
+    elif strategy == "auto":
+        monitor.set_gas_strategy(address, "auto")
+        response = "🤖 **Auto Gas Strategy**\n\nSmart automatic selection based on market conditions."
+    else:
+        await update.message.reply_text("❌ Invalid strategy. Use: normal, priority, custom, or auto")
+        return
+    
+    # Get current gas for reference
+    gas_prices = await monitor.gas_manager.get_eth_gas_prices()
+    current_fast = gas_prices.get("fast", 50)
+    current_usd = monitor.gas_manager.gwei_to_usd(current_fast)
+    
+    await update.message.reply_text(
+        f"{response}\n\n"
+        f"📝 Contract: `{address[:15]}...`\n"
+        f"⛽ Current fast gas: {current_fast} Gwei (~${current_usd})\n\n"
+        f"✅ Gas strategy saved!\n"
+        f"🎯 Use `/snipe {address[:15]}... <amount>` to arm auto-mint!",
+        parse_mode="Markdown"
+    )
+
+async def gaslimit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
         await update.message.reply_text(
-            f"✅ **Watching!**\n\n📝 `{address[:20]}...`\n🔗 {chain.upper()}\n\n🎯 Use `/snipe` to arm auto-mint",
+            "⛽ **Set USD Gas Limit**\n\n"
+            "Usage: `/gaslimit <contract> <max_usd>`\n\n"
+            "**Example:** `/gaslimit 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0 10`\n\n"
+            "Bot will NOT execute if gas fees exceed $10!\n\n"
+            "💡 Combine with gas strategy for maximum control.",
             parse_mode="Markdown"
         )
+        return
+    
+    address = context.args[0].lower().strip()
+    try:
+        max_usd = float(context.args[1])
+        if max_usd < 1:
+            await update.message.reply_text("❌ Gas limit must be at least $1")
+            return
     except ValueError:
-        await update.message.reply_text("❌ Invalid chain. Use: eth or sol")
+        await update.message.reply_text("❌ Invalid amount. Use numbers like: 5, 10, 20")
+        return
+    
+    if address not in monitor.watched:
+        await update.message.reply_text("❌ Contract not watched. Use `/watch` first!", parse_mode="Markdown")
+        return
+    
+    monitor.set_max_gas_usd(address, max_usd)
+    max_gwei = monitor.gas_manager.usd_to_gwei(max_usd)
+    
+    await update.message.reply_text(
+        f"⛽ **USD Gas Limit Set!**\n\n"
+        f"📝 Contract: `{address[:15]}...`\n"
+        f"💰 Max Gas: **${max_usd}** (~{max_gwei} Gwei)\n\n"
+        f"🛑 Bot will ONLY mint if gas fees are below ${max_usd}!",
+        parse_mode="Markdown"
+    )
 
 async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or len(context.args) < 2:
+    if len(context.args) < 2:
         await update.message.reply_text(
-            "❌ Usage: `/snipe <contract> <amount>`\n\nExample: `/snipe 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0 2`\n\n"
-            f"💰 Fee: {FEE_PERCENTAGE}% of mint amount",
+            f"🎯 **Snipe**\n\n"
+            "Usage: `/snipe <contract> <amount>`\n\n"
+            "**Example:** `/snipe 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0 2`\n\n"
+            f"💰 Fee: {FEE_PERCENTAGE}% of mint amount\n\n"
+            f"⛙ First set your gas strategy:\n"
+            f"• `/gasstrategy <contract> priority` - For hyped mints\n"
+            f"• `/gasstrategy <contract> normal` - For normal mints\n"
+            f"• `/gaslimit <contract> 10` - Max $10 gas\n\n"
+            f"🔑 Set NFT requirements:\n"
+            f"• `/seteligibility <contract> <nft_address>`\n\n"
+            f"⚡ Then snipe will auto-execute with your preferences!",
             parse_mode="Markdown"
         )
         return
@@ -497,60 +689,107 @@ async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = int(context.args[1])
         if amount < 1 or amount > 50:
             raise ValueError
-    except ValueError:
+    except:
         await update.message.reply_text("❌ Amount must be 1-50")
         return
     
     if address not in monitor.watched:
-        await update.message.reply_text(
-            f"❌ Contract not watched.\nUse `/autodetect {address}` first!",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("❌ Contract not watched. Use `/watch` first!", parse_mode="Markdown")
         return
     
     contract = monitor.watched[address]
-    
-    # Check if user has a wallet for this chain
     user_id = update.effective_user.id
-    has_wallet = any(w.get("chain") == contract.chain for w in user_wallets.get(user_id, []))
     
-    if not has_wallet:
+    # Check if user has wallet for this chain
+    user_wallet = None
+    for w in user_wallets.get(user_id, []):
+        if w.get("chain") == contract.chain:
+            user_wallet = w
+            break
+    
+    if not user_wallet:
+        await update.message.reply_text(f"❌ No {contract.chain.upper()} wallet. Use `/addwallet` first!", parse_mode="Markdown")
+        return
+    
+    # ✅ Check eligibility before arming
+    wallet_address = user_wallet["address"]
+    elig = await monitor.check_eligibility(address, wallet_address)
+    
+    if not elig["eligible"]:
         await update.message.reply_text(
-            f"❌ No {contract.chain.upper()} wallet.\nUse `/addwallet` first!\n\n"
-            f"⚠️ You need to provide your PRIVATE KEY",
+            f"❌ **Not Eligible to Snipe**\n\n{elig['message']}\n\n"
+            f"Required NFT(s) not found in your wallet:\n`{wallet_address}`\n\n"
+            f"Use `/seteligibility` to change requirements or `/removeeligibility` to remove them.",
             parse_mode="Markdown"
         )
         return
     
-    monitor.watched[address].armed_snipe = {
-        "amount": amount,
-        "user_id": user_id,
-        "armed_at": time.time()
-    }
+    # Arm the snipe
+    monitor.watched[address].armed_snipe = {"amount": amount, "user_id": user_id, "armed_at": time.time()}
     monitor.save_data()
     
-    auto_tag = " (auto-detected)" if contract.auto_detected_chain else ""
+    # Build response message
+    gas_msg = ""
+    if contract.gas_config:
+        gc = contract.gas_config
+        if gc.strategy == "priority":
+            gas_msg = f"\n⛙ **Gas:** Priority ({int((gc.priority_multiplier-1)*100)}% premium)"
+        elif gc.strategy == "custom":
+            gas_msg = f"\n⛙ **Gas:** Custom ({gc.max_gwei} Gwei)"
+        elif gc.strategy == "auto":
+            gas_msg = f"\n⛙ **Gas:** Auto"
+        else:
+            gas_msg = f"\n⛙ **Gas:** Normal"
+    
+    if contract.max_gas_usd:
+        gas_msg += f"\n💰 **Max Gas:** ${contract.max_gas_usd}"
+    
+    elig_msg = ""
+    if contract.required_nfts:
+        elig_msg = f"\n🔑 **Eligibility:** {len(contract.required_nfts)} NFT(s) required ✅ Verified"
     
     await update.message.reply_text(
         f"🎯 **Auto-Mint Armed!**\n\n"
         f"📦 {amount} NFT(s)\n"
-        f"🔗 {contract.chain.upper()}{auto_tag}\n"
-        f"💰 Fee: {FEE_PERCENTAGE}%\n\n"
-        f"⚡ Will trigger when mint goes live!",
+        f"🔗 {contract.chain.upper()}\n"
+        f"💰 Fee: {FEE_PERCENTAGE}% of mint amount{gas_msg}{elig_msg}\n\n"
+        f"⚡ Will trigger when mint goes live!\n"
+        f"🛑 Bot respects your gas strategy and eligibility requirements!",
         parse_mode="Markdown"
     )
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not monitor.watched:
-        await update.message.reply_text("📭 No contracts monitored.\nTry `/autodetect <contract>`", parse_mode="Markdown")
+        await update.message.reply_text("📭 No contracts monitored.\nUse `/watch` to add one.", parse_mode="Markdown")
         return
     
-    message = "**📋 Monitored Contracts**\n\n"
+    gas_prices = await monitor.gas_manager.get_eth_gas_prices()
+    current_usd = monitor.gas_manager.gwei_to_usd(gas_prices.get("fast", 50))
+    
+    message = "**📋 Watched Contracts**\n\n"
     for addr, contract in monitor.watched.items():
-        status = "🟢 LIVE" if contract.is_minting else "⏳ Waiting"
-        snipe = f"🎯 {contract.armed_snipe['amount']} NFTs" if contract.armed_snipe else "⚡ Not armed"
-        auto_tag = " 🤖" if contract.auto_detected_chain else ""
-        message += f"`{addr[:12]}...` - {contract.chain.upper()}{auto_tag}\n{status} | {snipe}\n\n"
+        snipe = f"🎯 {contract.armed_snipe['amount']} NFTs" if contract.armed_snipe else "⚡ No snipe"
+        
+        gas_display = "⛽ No gas strategy"
+        if contract.gas_config:
+            g = contract.gas_config
+            if g.strategy == "priority":
+                gas_display = f"⛽ Priority {int((g.priority_multiplier-1)*100)}%+"
+            elif g.strategy == "custom":
+                gas_display = f"⛽ Custom {g.max_gwei} Gwei"
+            elif g.strategy == "auto":
+                gas_display = "⛽ Auto"
+            else:
+                gas_display = "⛽ Normal"
+        
+        if contract.max_gas_usd:
+            gas_display += f" | 💰 ${contract.max_gas_usd} max"
+        
+        elig_display = f" | 🔑 {len(contract.required_nfts)} NFT req" if contract.required_nfts else ""
+        
+        message += f"`{addr[:12]}...` - {contract.chain.upper()}\n{snipe}\n{gas_display}{elig_display}\n\n"
+    
+    message += f"\n---\n⛽ **Current Fast Gas:** ~${current_usd}"
     
     await update.message.reply_text(message, parse_mode="Markdown")
 
@@ -573,12 +812,27 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ No active snipe")
 
 async def gas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    gas_prices = await monitor.gas_manager.get_eth_gas_prices()
+    
+    slow_usd = monitor.gas_manager.gwei_to_usd(gas_prices.get("slow", 30))
+    std_usd = monitor.gas_manager.gwei_to_usd(gas_prices.get("standard", 40))
+    fast_usd = monitor.gas_manager.gwei_to_usd(gas_prices.get("fast", 50))
+    
+    alchemy_status = "✅ Connected" if ALCHEMY_API_KEY else "❌ Not configured (add ALCHEMY_API_KEY)"
+    
     await update.message.reply_text(
-        "⛽ **Gas Fees**\n\n"
-        "**Ethereum:** https://etherscan.io/gastracker\n"
-        "**Solana:** https://solanabeach.io/\n\n"
-        f"💰 Bot fee: {FEE_PERCENTAGE}% of mint amount\n"
-        f"🔒 Fee wallet hidden",
+        f"⛽ **Current Gas Fees (ETH)**\n\n"
+        f"• 🐢 Slow: {gas_prices.get('slow', 30)} Gwei (~${slow_usd})\n"
+        f"• ⚡ Standard: {gas_prices.get('standard', 40)} Gwei (~${std_usd})\n"
+        f"• 🚀 Fast: {gas_prices.get('fast', 50)} Gwei (~${fast_usd})\n"
+        f"• 📊 Base Fee: {gas_prices.get('base_fee', 25)} Gwei\n\n"
+        f"**Gas Strategies Available:**\n"
+        f"• 🐢 Normal - Standard gas\n"
+        f"• 🚀 Priority - Fast gas + premium (for hyped mints!)\n"
+        f"• 🎯 Custom - Your own Gwei value\n"
+        f"• 🤖 Auto - Smart selection\n\n"
+        f"**Alchemy API:** {alchemy_status}\n"
+        f"**Bot Fee:** {FEE_PERCENTAGE}% of mint amount",
         parse_mode="Markdown"
     )
 
@@ -591,9 +845,9 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ MAIN ============
 def main():
-    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    if not TELEGRAM_TOKEN:
         print("❌ ERROR: TELEGRAM_TOKEN not set!")
-        print("Add TELEGRAM_TOKEN in environment variables")
+        print("Add TELEGRAM_TOKEN to environment variables")
         return
     
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -608,11 +862,14 @@ def main():
     )
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("autodetect", autodetect_command))
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("wallets", wallets_command))
     app.add_handler(CommandHandler("watch", watch_command))
+    app.add_handler(CommandHandler("seteligibility", seteligibility_command))
+    app.add_handler(CommandHandler("removeeligibility", removeeligibility_command))
+    app.add_handler(CommandHandler("listeligibility", listeligibility_command))
+    app.add_handler(CommandHandler("gasstrategy", gasstrategy_command))
+    app.add_handler(CommandHandler("gaslimit", gaslimit_command))
     app.add_handler(CommandHandler("snipe", snipe_command))
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
@@ -620,27 +877,15 @@ def main():
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_error_handler(error_handler)
     
-    async def start_monitoring():
-        await monitor.start_monitoring(app)
-    
-    def run_monitoring():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(start_monitoring())
-    
-    monitor_thread = threading.Thread(target=run_monitoring, daemon=True)
-    monitor_thread.start()
-    
-    print("=" * 50)
-    print("🤖 NFT AUTO-MINT BOT")
-    print("=" * 50)
-    print(f"💰 Fee: {FEE_PERCENTAGE}%")
-    print(f"🔗 Chains: Ethereum + Solana")
-    print(f"🔒 Fee wallet: Hidden")
-    print(f"🔍 Auto-detect: ENABLED")
-    print("=" * 50)
+    print("=" * 60)
+    print("🤖 NFT AUTO-MINT BOT (with Alchemy API Eligibility)")
+    print("=" * 60)
+    print(f"💰 Fee: {FEE_PERCENTAGE}% of mint amount")
+    print(f"🔑 Alchemy API: {'✅ ENABLED' if ALCHEMY_API_KEY else '❌ DISABLED (add ALCHEMY_API_KEY)'}")
+    print(f"🔗 Chains: Ethereum, Solana")
+    print("=" * 60)
     print("🟢 Bot is running!")
-    print("=" * 50)
+    print("=" * 60)
     
     app.run_polling()
 

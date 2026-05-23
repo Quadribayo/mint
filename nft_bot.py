@@ -309,7 +309,9 @@ class ProjectMonitor:
                     if not user_wallet:
                         log.warning(f"  → No wallet found for user {snipe['user_id']}")
                         await self._notify(project.added_by,
-                            f"❌ *Mint is live but no wallet found!*\nAdd one with /addwallet")
+                            f"❌ MINT IS LIVE but no wallet found!\n\n"
+                            f"Project: {project.project_name}\n"
+                            f"Add a wallet with /addwallet then re-arm with /snipe")
                         continue
 
                     # Mark executed BEFORE sending tx to prevent double-mint
@@ -321,10 +323,22 @@ class ProjectMonitor:
                     if result["success"]:
                         await self._notify(project.added_by, self._success_msg(project, result))
                     else:
-                        # Un-mark so user can retry
+                        # Un-mark so bot retries next cycle
                         project.armed_snipe["executed"] = False
+                        project.armed_snipe["fail_count"] = snipe.get("fail_count", 0) + 1
+                        project.armed_snipe["last_error"] = result.get("error", "Unknown")
                         self.save_data()
-                        await self._notify(project.added_by, self._fail_msg(project, result))
+                        # Get wallet balance for context
+                        balance_eth = 0.0
+                        try:
+                            bal_wei = web3.eth.get_balance(web3.to_checksum_address(user_wallet.address))
+                            balance_eth = bal_wei / 10**18
+                        except Exception:
+                            pass
+                        await self._notify(
+                            project.added_by,
+                            self._fail_msg(project, result, balance_eth)
+                        )
 
             except Exception as e:
                 log.error(f"monitor_loop error: {e}")
@@ -337,7 +351,13 @@ class ProjectMonitor:
         try:
             await self.bot_app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
         except Exception as e:
-            log.error(f"_notify error: {e}")
+            log.warning(f"Markdown send failed, retrying as plain text: {e}")
+            try:
+                # Strip markdown and send as plain text
+                plain = text.replace("*", "").replace("`", "").replace("_", "")
+                await self.bot_app.bot.send_message(chat_id=chat_id, text=plain)
+            except Exception as e2:
+                log.error(f"_notify plain text also failed: {e2}")
 
     def _success_msg(self, project: TrackedProject, result: Dict) -> str:
         snipe = project.armed_snipe or {}
@@ -352,12 +372,45 @@ class ProjectMonitor:
             f"🎉 Check your wallet!"
         )
 
-    def _fail_msg(self, project: TrackedProject, result: Dict) -> str:
+    def _fail_msg(self, project: TrackedProject, result: Dict, balance_eth: float = 0.0) -> str:
+        raw_error = result.get("error", "Unknown")
+        safe_error = (
+            raw_error
+            .replace("*", "").replace("`", "").replace("_", "")
+            .replace("{", "").replace("}", "")[:300]
+        )
+
+        # Diagnose common errors into plain English
+        if "insufficient funds" in raw_error.lower():
+            diagnosis = (
+                f"Your wallet only has {balance_eth:.6f} ETH.\n"
+                f"You need more ETH to cover mint price + gas.\n"
+                f"Top up your wallet and the bot will retry automatically."
+            )
+        elif "nonce" in raw_error.lower():
+            diagnosis = "Nonce mismatch — a previous pending tx may be stuck. Bot will retry."
+        elif "gas" in raw_error.lower():
+            diagnosis = "Gas estimation failed — contract may have reverted. Bot will retry."
+        elif "No selector succeeded" in raw_error:
+            diagnosis = "Could not find the right mint function on this contract. Check the contract address."
+        elif "replacement transaction underpriced" in raw_error.lower():
+            diagnosis = "A previous tx is pending with higher gas. Bot will retry."
+        else:
+            diagnosis = "Bot will retry automatically on next cycle."
+
+        snipe = project.armed_snipe or {}
+        fail_count = snipe.get("fail_count", 1)
+
         return (
-            f"❌ *MINT FAILED — Retrying next cycle*\n\n"
-            f"📊 *Project:* {project.project_name}\n"
-            f"⚠️ *Error:* {result.get('error', 'Unknown')}\n\n"
-            f"Bot will retry in 10 seconds."
+            f"❌ MINT TRANSACTION FAILED\n\n"
+            f"Project: {project.project_name}\n"
+            f"Stage: {snipe.get('stage_name', '?')}\n"
+            f"Amount: {snipe.get('amount', '?')} NFT(s)\n"
+            f"Wallet balance: {balance_eth:.6f} ETH\n"
+            f"Attempt: #{fail_count}\n\n"
+            f"Error: {safe_error}\n\n"
+            f"Diagnosis: {diagnosis}\n\n"
+            f"Use /cancel to stop retrying."
         )
 
 # ============ TELEGRAM HANDLERS ============
